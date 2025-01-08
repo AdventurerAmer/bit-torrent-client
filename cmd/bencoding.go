@@ -48,6 +48,7 @@ func decode(s string) (any, string, error) {
 		}
 		if head == 'd' {
 			if len(value)%2 != 0 {
+				fmt.Println(value)
 				return nil, "", fmt.Errorf("invalid dictionary bencoding: number of keys doesn't match values")
 			}
 			dict := make(map[string]any)
@@ -59,9 +60,8 @@ func decode(s string) (any, string, error) {
 				dict[key] = value[i+1]
 			}
 			return dict, "", nil
-		} else {
-			return value, "", nil
 		}
+		return value, "", nil
 	default:
 		if unicode.IsNumber(head) {
 			colonIndex := strings.IndexRune(s, ':')
