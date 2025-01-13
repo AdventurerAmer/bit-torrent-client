@@ -145,7 +145,6 @@ func parseTorrentFile(filepath string) (*Torrent, error) {
 type Peer struct {
 	IP   net.IP
 	Port int
-	Conn net.Conn
 }
 
 type Handshake struct {
@@ -238,6 +237,34 @@ func (m *Message) Serialize() []byte {
 	return b.Bytes()
 }
 
+func (m *Message) String() string {
+	if m == nil {
+		return "KeepAlive"
+	}
+	switch m.ID {
+	case MsgChoke:
+		return "Choke"
+	case MsgUnchoke:
+		return "Unchoke"
+	case MsgInterested:
+		return "Interested"
+	case MsgNotInterested:
+		return "Not Interested"
+	case MsgHave:
+		return "Have"
+	case MsgBitfield:
+		return "Bitfield"
+	case MsgRequest:
+		return "Request"
+	case MsgPiece:
+		return "Piece"
+	case MsgCancel:
+		return "Cancel"
+	default:
+		return "Unkown"
+	}
+}
+
 func ReadMessage(r io.Reader) (*Message, error) {
 	lengthBuf := make([]byte, 4)
 	_, err := io.ReadFull(r, lengthBuf)
@@ -256,7 +283,7 @@ func ReadMessage(r io.Reader) (*Message, error) {
 	}
 	return &Message{
 		ID:      messageID(msg[0]),
-		Payload: msg[:1],
+		Payload: msg[1:],
 	}, nil
 }
 
@@ -272,6 +299,17 @@ func (b BitField) Set(index int) {
 	byteIndex := index / 8
 	offset := index % 8
 	b[byteIndex] |= 1 << (7 - offset)
+}
+
+type PieceRequest struct {
+	Index  int
+	Hash   [20]byte
+	Length int
+}
+
+type PieceResponce struct {
+	Index int
+	Data  []byte
 }
 
 func main() {
@@ -293,44 +331,171 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	handShake := NewHandshake(torrent, peerID)
-	handShakeMsg := handShake.Serialize()
-	// unchokeMsg := &Message{ID: MsgUnchoke}
-	// interestedMsg := &Message{ID: MsgInterested}
-
-	for _, peer := range peers {
-		addr := fmt.Sprintf("%s:%d", peer.IP, peer.Port)
-		conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
-		if err != nil {
-			log.Println(err)
-			continue
+	requests := make(chan PieceRequest, len(torrent.Pieces))
+	responses := make(chan PieceResponce, len(torrent.Pieces))
+	for i := 0; i < len(torrent.Pieces); i++ {
+		requests <- PieceRequest{
+			Index:  i,
+			Hash:   torrent.Pieces[i],
+			Length: torrent.PieceLength,
 		}
-		_, err = conn.Write(handShakeMsg)
-		if err != nil {
-			conn.Close()
-			log.Println(err)
-			continue
-		}
-		buf := make([]byte, 4096)
-		n, err := conn.Read(buf[:])
-		if err != nil {
-			conn.Close()
-			log.Println(err)
-			continue
-		}
-		peerHandShake, err := ReadHandshake(bytes.NewReader(buf[:n]))
-		if err != nil {
-			conn.Close()
-			log.Println(err)
-			continue
-		}
-
-		if !bytes.Equal(peerHandShake.InfoHash[:], torrent.InfoHash[:]) {
-			conn.Close()
-			log.Printf("failed to handshake peer: %s", addr)
-			continue
-		}
-
-		log.Printf("Completed handshake with %s\n", addr)
 	}
+	for _, peer := range peers {
+		go func(peer Peer, requestCh chan PieceRequest, responses chan<- PieceResponce) {
+			addr := fmt.Sprintf("%s:%d", peer.IP, peer.Port)
+			conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+			if err != nil {
+				log.Println(err)
+				return
+			}
+			defer conn.Close()
+			handShake := NewHandshake(torrent, peerID)
+			handShakeMsg := handShake.Serialize()
+			_, err = conn.Write(handShakeMsg)
+			if err != nil {
+				log.Println(err)
+				return
+			}
+			buf := make([]byte, 4096)
+			n, err := conn.Read(buf[:])
+			if err != nil {
+				log.Println(err)
+				return
+			}
+			peerHandShake, err := ReadHandshake(bytes.NewReader(buf[:n]))
+			if err != nil {
+				log.Println(err)
+				return
+			}
+
+			if !bytes.Equal(peerHandShake.InfoHash[:], torrent.InfoHash[:]) {
+				log.Printf("failed to handshake peer: %s", addr)
+				return
+			}
+
+			log.Printf("Completed handshake with %s\n", addr)
+			bitFieldMsg, err := ReadMessage(conn)
+			if err != nil {
+				log.Println(err)
+				return
+			}
+
+			if bitFieldMsg == nil {
+				return
+			}
+
+			if bitFieldMsg.ID != MsgBitfield {
+				log.Printf("couldn't get bitfield from peer: %s", addr)
+				return
+			}
+
+			bitField := BitField(bitFieldMsg.Payload)
+			log.Printf("got bitfield %s from peer: %s", string(bitField), addr)
+
+			unchokeMsg := &Message{ID: MsgUnchoke}
+			conn.Write(unchokeMsg.Serialize())
+
+			interestedMsg := &Message{ID: MsgInterested}
+			conn.Write(interestedMsg.Serialize())
+
+			Choked := true
+
+			for {
+				request, ok := <-requests
+				if !ok {
+					break
+				}
+				if !bitField.IsSet(request.Index) {
+					requests <- request
+					continue
+				}
+				requestBuf := make([]byte, request.Length)
+				const MaxBlockSize = 16384
+				const MaxBacklog = 5
+				downloaded := 0
+				offset := 0
+				backlog := 0
+			loop:
+				for downloaded < request.Length {
+					if !Choked {
+						for offset < request.Length && backlog < MaxBacklog {
+							blockSize := MaxBlockSize
+							if request.Length-offset < blockSize {
+								blockSize = request.Length - offset
+							}
+							payload := make([]byte, 12)
+							binary.BigEndian.PutUint32(payload[:4], uint32(request.Index))
+							binary.BigEndian.PutUint32(payload[4:8], uint32(offset))
+							binary.BigEndian.PutUint32(payload[8:12], uint32(blockSize))
+							requestMsg := &Message{
+								ID:      MsgRequest,
+								Payload: payload,
+							}
+							_, err := conn.Write(requestMsg.Serialize())
+							if err != nil {
+								log.Println(err)
+								requests <- request
+								break loop
+							}
+							offset += blockSize
+							backlog++
+						}
+					}
+					msg, err := ReadMessage(conn)
+					if err != nil {
+						log.Println(err)
+						requests <- request
+						break loop
+					}
+					switch msg.ID {
+					case MsgUnchoke:
+						Choked = false
+					case MsgChoke:
+						Choked = true
+					case MsgHave:
+						if len(msg.Payload) != 4 {
+							log.Printf("malformed msg %s payload must be 4 bytes", msg)
+							break
+						}
+						index := binary.BigEndian.Uint32(msg.Payload)
+						bitField.Set(int(index))
+					case MsgPiece:
+						if len(msg.Payload) < 8 {
+							log.Printf("malformed msg %s payload must be atleast 8 bytes", msg)
+							break
+						}
+						parsedIndex := binary.BigEndian.Uint32(msg.Payload[0:4])
+						if parsedIndex != uint32(request.Index) {
+							log.Printf("malformed msg %s expected piece index: %d got %d", msg, request.Index, int(parsedIndex))
+							break
+						}
+						offset := binary.BigEndian.Uint32(msg.Payload[4:8])
+						if offset >= MaxBlockSize {
+							log.Printf("malformed msg %s offset: %d is too high", msg, int(offset))
+							break
+						}
+						data := msg.Payload[8:]
+						if len(data) > MaxBlockSize {
+							log.Printf("malformed msg %s data length: %d is too high", msg, len(data))
+							break
+						}
+						downloaded += len(data)
+						backlog--
+						copy(requestBuf[offset:], data)
+					}
+				}
+
+				responses <- PieceResponce{
+					Index: request.Index,
+					Data:  requestBuf,
+				}
+			}
+		}(peer, requests, responses)
+	}
+	for i := 0; i < len(torrent.Pieces); i++ {
+		resp := <-responses
+		log.Println(resp)
+	}
+	close(requests)
+	close(responses)
 }
