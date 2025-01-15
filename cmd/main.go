@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha1"
 	"encoding/binary"
@@ -15,66 +16,99 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
 // TODO: use reflection to implement Unmarshal on the `Torrent` Struct
 type Torrent struct {
-	Announce    string
-	Name        string
-	Length      int
-	PieceLength int
-	Pieces      [][20]byte
-	InfoHash    [20]byte
+	Announce     string
+	AnnounceList []string
+	Name         string
+	Length       int
+	Files        []map[string]any
+	PieceLength  int
+	Pieces       [][20]byte
+	InfoHash     [20]byte
 }
 
-func (t Torrent) GetPeers(peerID [20]byte, port int) ([]Peer, error) {
-	base, err := url.Parse(t.Announce)
-	if err != nil {
-		return nil, err
+func (t Torrent) GetPeers(peerID [20]byte, port int) []Peer {
+	announceUrls := []string{t.Announce}
+	announceUrls = append(announceUrls, t.AnnounceList...)
+	peerSet := make(map[string]Peer)
+	// TODO: make this concurrent
+	for _, announceUrl := range announceUrls {
+		func() {
+			base, err := url.Parse(announceUrl)
+			if err != nil {
+				log.Println(err)
+				return
+			}
+			params := url.Values{
+				"info_hash":  []string{string(t.InfoHash[:])},
+				"peer_id":    []string{string(peerID[:])},
+				"port":       []string{strconv.Itoa(port)},
+				"uploaded":   []string{"0"},
+				"downloaded": []string{"0"},
+				"compact":    []string{"1"},
+				"left":       []string{strconv.Itoa(t.Length)},
+			}
+			base.RawQuery = params.Encode()
+			trackerURL := base.String()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			req, err := http.NewRequestWithContext(ctx, "GET", trackerURL, nil)
+			if err != nil {
+				log.Println(err)
+				return
+			}
+
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				log.Println(err)
+				return
+			}
+
+			defer resp.Body.Close()
+			body, err := decodeBecoding(resp.Body)
+			if err != nil {
+				log.Println(err, resp.Body)
+				return
+			}
+			data, ok := body.(map[string]any)
+			if !ok {
+				log.Printf("expected a dictionary got %T", data)
+				return
+			}
+			peersStr, ok := data["peers"].(string)
+			if !ok {
+				log.Printf("missing \"peers\" key in %v", data)
+				return
+			}
+			// assuming ipv4 here
+			if len(peersStr)%6 != 0 {
+				log.Println("invalid peers string: len(peers) must be divisible by 6")
+				return
+			}
+			peerCount := len(peersStr) / 6
+			for i := 0; i < peerCount; i++ {
+				peerData := []byte(peersStr[i*6:])
+				peer := Peer{
+					IP:   net.IP(peerData[:4]),
+					Port: int(binary.BigEndian.Uint16(peerData[4:])),
+				}
+				peerStr := fmt.Sprintf("%s:%d", peer.IP, peer.Port)
+				peerSet[peerStr] = peer
+			}
+		}()
 	}
-	params := url.Values{
-		"info_hash":  []string{string(t.InfoHash[:])},
-		"peer_id":    []string{string(peerID[:])},
-		"port":       []string{strconv.Itoa(port)},
-		"uploaded":   []string{"0"},
-		"downloaded": []string{"0"},
-		"compact":    []string{"1"},
-		"left":       []string{strconv.Itoa(t.Length)},
+	peers := make([]Peer, 0, len(peerSet))
+	for _, v := range peerSet {
+		peers = append(peers, v)
 	}
-	base.RawQuery = params.Encode()
-	trackerURL := base.String()
-	resp, err := http.Get(trackerURL)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	body, err := decodeBecoding(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	data, ok := body.(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("expected a dictionary got %T", data)
-	}
-	peersStr, ok := data["peers"].(string)
-	if !ok {
-		return nil, fmt.Errorf("missing \"peers\" key in %v", data)
-	}
-	// assuming ipv4 here
-	if len(peersStr)%6 != 0 {
-		return nil, fmt.Errorf("invalid peers string: len(peers) must be divisible by 6")
-	}
-	peerCount := len(peersStr) / 6
-	peers := make([]Peer, peerCount)
-	for i := 0; i < peerCount; i++ {
-		peer := []byte(peersStr[i*6:])
-		peers[i] = Peer{
-			IP:   net.IP(peer[:4]),
-			Port: int(binary.BigEndian.Uint16(peer[4:])),
-		}
-	}
-	return peers, nil
+	return peers
 }
 
 func parseTorrentFile(filepath string) (*Torrent, error) {
@@ -90,9 +124,26 @@ func parseTorrentFile(filepath string) (*Torrent, error) {
 	if !ok {
 		return nil, errors.New("invalid torrent file: missing \"metainfo\" map")
 	}
-	announce := metainfo["announce"].(string)
-	if announce == "" {
+	announce, ok := metainfo["announce"].(string)
+	if !ok {
 		return nil, errors.New("invalid torrent file: missing \"announce\" key")
+	}
+	announceUrls := []string{}
+	announceList, ok := metainfo["announce-list"].([]any)
+	if ok {
+		for listIndex, list := range announceList {
+			items, ok := list.([]any)
+			if !ok {
+				return nil, fmt.Errorf("invalid torrent file: invalid announce list type at index %d expected []any got %T", listIndex, items)
+			}
+			for itemIndex, item := range items {
+				s, ok := item.(string)
+				if !ok {
+					return nil, fmt.Errorf("invalid torrent file: invalid announce list item type at index %d expected string got %T", itemIndex, item)
+				}
+				announceUrls = append(announceUrls, s)
+			}
+		}
 	}
 	info, ok := metainfo["info"].(map[string]any)
 	if !ok {
@@ -103,8 +154,24 @@ func parseTorrentFile(filepath string) (*Torrent, error) {
 		return nil, errors.New("invalid torrent file: type mismatch value of key \"name\" in info dictionary must a string")
 	}
 	length, ok := info["length"].(int)
+	files := []map[string]any{}
 	if !ok {
-		return nil, errors.New("invalid torrent file: type mismatch value of key \"length\" in info dictionary must a int")
+		filesList, ok := info["files"].([]any)
+		if !ok {
+			return nil, errors.New(`invalid torrent file: missing both "length" and "files" keys info dictionary`)
+		}
+		for idx, fileMap := range filesList {
+			file, ok := fileMap.(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf(`invalid torrent file: file number %d must be of type map[string]any`, idx)
+			}
+			fileLength, ok := file["length"].(int)
+			if !ok {
+				return nil, fmt.Errorf(`invalid torrent file: "length" key of file number %d must be an int`, idx)
+			}
+			length += fileLength
+			files = append(files, file)
+		}
 	}
 	pieceLength, ok := info["piece length"].(int)
 	if !ok {
@@ -122,22 +189,26 @@ func parseTorrentFile(filepath string) (*Torrent, error) {
 	for i := 0; i < pieceCount; i++ {
 		copy(pieces[i][:], piecesStr[i*20:i*20+20])
 	}
-	// TODO: this only works for a torrent file that has a single file.
-	// 6:lengthi%de
-	// 4:name%d:%s
-	// 12:piece lengthi%de
-	// 6:pieces%d:%s
-	infoStr := fmt.Sprintf("d6:lengthi%de4:name%d:%s12:piece lengthi%de6:pieces%d:%se", length, len(name), name, pieceLength, len(piecesStr), piecesStr)
+	// @Hack until i implement marshaling
+	infoLiteral := "4:info"
+	idx := strings.Index(string(p), infoLiteral)
+	s := string(p[idx+len(infoLiteral):])
+	_, remaining, _ := decode(s)
+	infoStr := s[:len(s)-len(remaining)]
+
 	hasher := sha1.New()
 	hasher.Write([]byte(infoStr))
 	hash := hasher.Sum(nil)
+	infoHash := [20]byte(hash)
 	t := &Torrent{
-		Announce:    announce,
-		Name:        name,
-		Length:      length,
-		PieceLength: pieceLength,
-		Pieces:      pieces,
-		InfoHash:    [20]byte(hash),
+		Announce:     announce,
+		AnnounceList: announceUrls,
+		Name:         name,
+		Length:       length,
+		Files:        files,
+		PieceLength:  pieceLength,
+		Pieces:       pieces,
+		InfoHash:     infoHash,
 	}
 	return t, nil
 }
@@ -301,6 +372,19 @@ func (b BitField) Set(index int) {
 	b[byteIndex] |= 1 << (7 - offset)
 }
 
+func (b BitField) String() string {
+	if b == nil {
+		return "[]"
+	}
+	var builder strings.Builder
+	builder.WriteString("[")
+	for i := 0; i < len(b); i++ {
+		builder.WriteString(fmt.Sprintf("%08b", b[i]))
+	}
+	builder.WriteString("]")
+	return builder.String()
+}
+
 type PieceRequest struct {
 	Index  int
 	Hash   [20]byte
@@ -317,6 +401,9 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	fmt.Println("Info Hash:", hex.EncodeToString(torrent.InfoHash[:]))
+	fmt.Println("Length", torrent.Length)
+
 	peerID := [20]byte{}
 	n, err := rand.Read(peerID[:])
 	if err != nil {
@@ -327,17 +414,22 @@ func main() {
 	}
 	port := 6881 // clients will try 6881 to 6889 before giving up.
 	fmt.Printf("Starting peer %s on port %d\n", hex.EncodeToString(peerID[:]), port)
-	peers, err := torrent.GetPeers(peerID, port)
-	if err != nil {
-		log.Fatal(err)
+	peers := torrent.GetPeers(peerID, port)
+	if len(peers) == 0 {
+		log.Fatal("failed to get peers")
 	}
 	requests := make(chan PieceRequest, len(torrent.Pieces))
 	responses := make(chan PieceResponce, len(torrent.Pieces))
 	for i := 0; i < len(torrent.Pieces); i++ {
+		start := i * torrent.PieceLength
+		end := start + torrent.PieceLength
+		if end > torrent.Length {
+			end = torrent.Length
+		}
 		requests <- PieceRequest{
 			Index:  i,
 			Hash:   torrent.Pieces[i],
-			Length: torrent.PieceLength,
+			Length: end - start,
 		}
 	}
 	for _, peer := range peers {
@@ -390,7 +482,7 @@ func main() {
 			}
 
 			bitField := BitField(bitFieldMsg.Payload)
-			log.Printf("got bitfield %s from peer: %s", string(bitField), addr)
+			log.Printf("got bitfield %s from peer: %s", bitField.String(), addr)
 
 			unchokeMsg := &Message{ID: MsgUnchoke}
 			conn.Write(unchokeMsg.Serialize())
@@ -464,18 +556,18 @@ func main() {
 							log.Printf("malformed msg %s payload must be atleast 8 bytes", msg)
 							break
 						}
-						parsedIndex := binary.BigEndian.Uint32(msg.Payload[0:4])
-						if parsedIndex != uint32(request.Index) {
-							log.Printf("malformed msg %s expected piece index: %d got %d", msg, request.Index, int(parsedIndex))
+						index := binary.BigEndian.Uint32(msg.Payload[:4])
+						if index != uint32(request.Index) {
+							log.Printf("malformed msg %s expected piece index: %d got %d", msg, request.Index, int(index))
 							break
 						}
 						offset := binary.BigEndian.Uint32(msg.Payload[4:8])
-						if offset >= MaxBlockSize {
+						if int(offset) >= request.Length {
 							log.Printf("malformed msg %s offset: %d is too high", msg, int(offset))
 							break
 						}
 						data := msg.Payload[8:]
-						if len(data) > MaxBlockSize {
+						if int(offset)+len(data) > request.Length {
 							log.Printf("malformed msg %s data length: %d is too high", msg, len(data))
 							break
 						}
@@ -485,6 +577,20 @@ func main() {
 					}
 				}
 
+				hash := sha1.Sum(requestBuf)
+				if !bytes.Equal(hash[:], request.Hash[:]) {
+					log.Printf("Piece %d failed integrity check\n", request.Index)
+					requests <- request
+					continue
+				}
+
+				havePayload := make([]byte, 4)
+				binary.BigEndian.PutUint32(havePayload, uint32(request.Index))
+				haveMsg := Message{
+					ID:      MsgHave,
+					Payload: havePayload,
+				}
+				conn.Write(haveMsg.Serialize())
 				responses <- PieceResponce{
 					Index: request.Index,
 					Data:  requestBuf,
@@ -492,10 +598,14 @@ func main() {
 			}
 		}(peer, requests, responses)
 	}
+	downloadedPices := 0
 	for i := 0; i < len(torrent.Pieces); i++ {
 		resp := <-responses
-		log.Println(resp)
+		downloadedPices++
+		progress := float64(downloadedPices) / float64(len(torrent.Pieces)) * 100
+		log.Printf("Downloaded Piece %d successfully progress %.2f%%", resp.Index, progress)
 	}
 	close(requests)
 	close(responses)
+	log.Printf("Success")
 }

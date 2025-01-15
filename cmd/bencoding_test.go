@@ -59,7 +59,7 @@ func TestListBdecoding(t *testing.T) {
 			t.Errorf("expected %s to be of type []any got %T", tests[i], data)
 			continue
 		}
-		if len(got) != len(expected) {
+		if len(got) != len(expected[i]) {
 			t.Errorf("expected %s to be of a slice of length %d got %d", tests[i], len(expected[i]), len(got))
 			continue
 		}

@@ -37,6 +37,7 @@ func decode(s string) (any, string, error) {
 		for len(s) > 0 {
 			if s[0] == 'e' {
 				s = s[1:]
+				break
 			} else {
 				item, remaining, err := decode(s)
 				if err != nil {
@@ -59,9 +60,9 @@ func decode(s string) (any, string, error) {
 				}
 				dict[key] = value[i+1]
 			}
-			return dict, "", nil
+			return dict, s, nil
 		}
-		return value, "", nil
+		return value, s, nil
 	default:
 		if unicode.IsNumber(head) {
 			colonIndex := strings.IndexRune(s, ':')
