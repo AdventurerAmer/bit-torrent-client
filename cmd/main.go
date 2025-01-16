@@ -6,10 +6,8 @@ import (
 	"crypto/rand"
 	"crypto/sha1"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -97,7 +95,7 @@ func (t Torrent) GetPeers(peerID [20]byte, port int) []Peer {
 				peerData := []byte(peersStr[i*6:])
 				peer := Peer{
 					IP:   net.IP(peerData[:4]),
-					Port: int(binary.BigEndian.Uint16(peerData[4:])),
+					Port: binary.BigEndian.Uint16(peerData[4:]),
 				}
 				peerStr := fmt.Sprintf("%s:%d", peer.IP, peer.Port)
 				peerSet[peerStr] = peer
@@ -213,178 +211,6 @@ func parseTorrentFile(filepath string) (*Torrent, error) {
 	return t, nil
 }
 
-type Peer struct {
-	IP   net.IP
-	Port int
-}
-
-type Handshake struct {
-	Str      string
-	InfoHash [20]byte
-	PeerID   [20]byte
-}
-
-func NewHandshake(t *Torrent, peerID [20]byte) *Handshake {
-	return &Handshake{
-		Str:      "BitTorrent protocol",
-		InfoHash: t.InfoHash,
-		PeerID:   peerID,
-	}
-}
-
-func (h *Handshake) Serialize() []byte {
-	var b bytes.Buffer
-	b.WriteByte(byte(len(h.Str)))
-	b.Write([]byte(h.Str))
-	extensions := make([]byte, 8)
-	b.Write(extensions)
-	b.Write(h.InfoHash[:])
-	b.Write(h.PeerID[:])
-	return b.Bytes()
-}
-
-func ReadHandshake(r io.Reader) (*Handshake, error) {
-	length := make([]byte, 1)
-	_, err := io.ReadFull(r, length)
-	if err != nil {
-		return nil, err
-	}
-	str := make([]byte, length[0])
-	_, err = io.ReadFull(r, str)
-	if err != nil {
-		return nil, err
-	}
-	extensions := make([]byte, 8)
-	_, err = io.ReadFull(r, extensions)
-	if err != nil {
-		return nil, err
-	}
-	infoHash := make([]byte, 20)
-	_, err = io.ReadFull(r, infoHash)
-	if err != nil {
-		return nil, err
-	}
-	peerID := make([]byte, 20)
-	_, err = io.ReadFull(r, peerID)
-	if err != nil {
-		return nil, err
-	}
-	return &Handshake{
-		Str:      string(str),
-		InfoHash: [20]byte(infoHash),
-		PeerID:   [20]byte(peerID),
-	}, nil
-}
-
-type messageID uint8
-
-const (
-	MsgChoke         messageID = 0
-	MsgUnchoke       messageID = 1
-	MsgInterested    messageID = 2
-	MsgNotInterested messageID = 3
-	MsgHave          messageID = 4
-	MsgBitfield      messageID = 5
-	MsgRequest       messageID = 6
-	MsgPiece         messageID = 7
-	MsgCancel        messageID = 8
-)
-
-type Message struct {
-	ID      messageID
-	Payload []byte
-}
-
-func (m *Message) Serialize() []byte {
-	if m == nil {
-		return make([]byte, 4)
-	}
-	var b bytes.Buffer
-	length := make([]byte, 4)
-	binary.BigEndian.PutUint32(length, uint32(len(m.Payload)+1))
-	b.Write(length)
-	b.WriteByte(byte(m.ID))
-	b.Write(m.Payload)
-	return b.Bytes()
-}
-
-func (m *Message) String() string {
-	if m == nil {
-		return "KeepAlive"
-	}
-	switch m.ID {
-	case MsgChoke:
-		return "Choke"
-	case MsgUnchoke:
-		return "Unchoke"
-	case MsgInterested:
-		return "Interested"
-	case MsgNotInterested:
-		return "Not Interested"
-	case MsgHave:
-		return "Have"
-	case MsgBitfield:
-		return "Bitfield"
-	case MsgRequest:
-		return "Request"
-	case MsgPiece:
-		return "Piece"
-	case MsgCancel:
-		return "Cancel"
-	default:
-		return "Unkown"
-	}
-}
-
-func ReadMessage(r io.Reader) (*Message, error) {
-	lengthBuf := make([]byte, 4)
-	_, err := io.ReadFull(r, lengthBuf)
-	if err != nil {
-		return nil, err
-	}
-	length := binary.BigEndian.Uint32(lengthBuf)
-	// keep-alive message
-	if length == 0 {
-		return nil, nil
-	}
-	msg := make([]byte, length)
-	_, err = io.ReadFull(r, msg)
-	if err != nil {
-		return nil, err
-	}
-	return &Message{
-		ID:      messageID(msg[0]),
-		Payload: msg[1:],
-	}, nil
-}
-
-type BitField []byte
-
-func (b BitField) IsSet(index int) bool {
-	byteIndex := index / 8
-	offset := index % 8
-	return b[byteIndex]>>(7-offset)&1 != 0
-}
-
-func (b BitField) Set(index int) {
-	byteIndex := index / 8
-	offset := index % 8
-	b[byteIndex] |= 1 << (7 - offset)
-}
-
-func (b BitField) String() string {
-	if b == nil {
-		return "[]"
-	}
-	var builder strings.Builder
-	builder.WriteString("[")
-	for i := 0; i < len(b); i++ {
-		builder.WriteString(fmt.Sprintf("%08b", b[i]))
-	}
-	builder.WriteString("]")
-	return builder.String()
-}
-
 type PieceRequest struct {
 	Index  int
 	Hash   [20]byte
@@ -396,25 +222,33 @@ type PieceResponce struct {
 	Data  []byte
 }
 
+func generateClientID() ([20]byte, error) {
+	clientID := [20]byte{}
+	n, err := rand.Read(clientID[:])
+	if err != nil {
+		return [20]byte{}, err
+	}
+	if n != len(clientID) {
+		return [20]byte{}, fmt.Errorf("failed to generate full ID: generated %d bytes but need %d", n, len(clientID))
+	}
+	return clientID, nil
+}
+
 func main() {
 	torrent, err := parseTorrentFile("sample.torrent")
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println("Info Hash:", hex.EncodeToString(torrent.InfoHash[:]))
-	fmt.Println("Length", torrent.Length)
-
-	peerID := [20]byte{}
-	n, err := rand.Read(peerID[:])
+	// fmt.Println("Info Hash:", hex.EncodeToString(torrent.InfoHash[:]))
+	// fmt.Println("Length", torrent.Length)
+	clientID, err := generateClientID()
 	if err != nil {
 		log.Fatal(err)
 	}
-	if n != len(peerID) {
-		log.Fatal("failed to generate peerID")
-	}
+
 	port := 6881 // clients will try 6881 to 6889 before giving up.
-	fmt.Printf("Starting peer %s on port %d\n", hex.EncodeToString(peerID[:]), port)
-	peers := torrent.GetPeers(peerID, port)
+	// fmt.Printf("Starting peer %s on port %d\n", hex.EncodeToString(peerID[:]), port)
+	peers := torrent.GetPeers(clientID, port)
 	if len(peers) == 0 {
 		log.Fatal("failed to get peers")
 	}
@@ -434,166 +268,55 @@ func main() {
 	}
 	for _, peer := range peers {
 		go func(peer Peer, requestCh chan PieceRequest, responses chan<- PieceResponce) {
-			addr := fmt.Sprintf("%s:%d", peer.IP, peer.Port)
-			conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+			conn, err := net.DialTimeout("tcp", peer.GetAddr(), 3*time.Second)
 			if err != nil {
 				log.Println(err)
 				return
 			}
 			defer conn.Close()
-			handShake := NewHandshake(torrent, peerID)
-			handShakeMsg := handShake.Serialize()
-			_, err = conn.Write(handShakeMsg)
+
+			err = peer.ShakeHands(conn, torrent.InfoHash, clientID)
 			if err != nil {
 				log.Println(err)
 				return
 			}
-			buf := make([]byte, 4096)
-			n, err := conn.Read(buf[:])
+			log.Printf("Completed handshake with peer: %s\n", peer)
+
+			err = peer.ReadBitField(conn, len(torrent.Pieces))
 			if err != nil {
 				log.Println(err)
 				return
 			}
-			peerHandShake, err := ReadHandshake(bytes.NewReader(buf[:n]))
-			if err != nil {
-				log.Println(err)
-				return
-			}
+			log.Printf("Got Bitfield from peer: %s\n", peer)
 
-			if !bytes.Equal(peerHandShake.InfoHash[:], torrent.InfoHash[:]) {
-				log.Printf("failed to handshake peer: %s", addr)
-				return
-			}
-
-			log.Printf("Completed handshake with %s\n", addr)
-			bitFieldMsg, err := ReadMessage(conn)
-			if err != nil {
-				log.Println(err)
-				return
-			}
-
-			if bitFieldMsg == nil {
-				return
-			}
-
-			if bitFieldMsg.ID != MsgBitfield {
-				log.Printf("couldn't get bitfield from peer: %s", addr)
-				return
-			}
-
-			bitField := BitField(bitFieldMsg.Payload)
-			log.Printf("got bitfield %s from peer: %s", bitField.String(), addr)
-
-			unchokeMsg := &Message{ID: MsgUnchoke}
-			conn.Write(unchokeMsg.Serialize())
-
-			interestedMsg := &Message{ID: MsgInterested}
-			conn.Write(interestedMsg.Serialize())
-
-			Choked := true
+			peer.SendUnchokeMessage(conn)
+			peer.SendInterestedMessage(conn)
 
 			for {
 				request, ok := <-requests
 				if !ok {
 					break
 				}
-				if !bitField.IsSet(request.Index) {
-					requests <- request
-					continue
-				}
-				requestBuf := make([]byte, request.Length)
-				const MaxBlockSize = 16384
-				const MaxBacklog = 5
-				downloaded := 0
-				offset := 0
-				backlog := 0
-			loop:
-				for downloaded < request.Length {
-					if !Choked {
-						for offset < request.Length && backlog < MaxBacklog {
-							blockSize := MaxBlockSize
-							if request.Length-offset < blockSize {
-								blockSize = request.Length - offset
-							}
-							payload := make([]byte, 12)
-							binary.BigEndian.PutUint32(payload[:4], uint32(request.Index))
-							binary.BigEndian.PutUint32(payload[4:8], uint32(offset))
-							binary.BigEndian.PutUint32(payload[8:12], uint32(blockSize))
-							requestMsg := &Message{
-								ID:      MsgRequest,
-								Payload: payload,
-							}
-							_, err := conn.Write(requestMsg.Serialize())
-							if err != nil {
-								log.Println(err)
-								requests <- request
-								break loop
-							}
-							offset += blockSize
-							backlog++
-						}
-					}
-					msg, err := ReadMessage(conn)
-					if err != nil {
-						log.Println(err)
-						requests <- request
-						break loop
-					}
-					switch msg.ID {
-					case MsgUnchoke:
-						Choked = false
-					case MsgChoke:
-						Choked = true
-					case MsgHave:
-						if len(msg.Payload) != 4 {
-							log.Printf("malformed msg %s payload must be 4 bytes", msg)
-							break
-						}
-						index := binary.BigEndian.Uint32(msg.Payload)
-						bitField.Set(int(index))
-					case MsgPiece:
-						if len(msg.Payload) < 8 {
-							log.Printf("malformed msg %s payload must be atleast 8 bytes", msg)
-							break
-						}
-						index := binary.BigEndian.Uint32(msg.Payload[:4])
-						if index != uint32(request.Index) {
-							log.Printf("malformed msg %s expected piece index: %d got %d", msg, request.Index, int(index))
-							break
-						}
-						offset := binary.BigEndian.Uint32(msg.Payload[4:8])
-						if int(offset) >= request.Length {
-							log.Printf("malformed msg %s offset: %d is too high", msg, int(offset))
-							break
-						}
-						data := msg.Payload[8:]
-						if int(offset)+len(data) > request.Length {
-							log.Printf("malformed msg %s data length: %d is too high", msg, len(data))
-							break
-						}
-						downloaded += len(data)
-						backlog--
-						copy(requestBuf[offset:], data)
-					}
-				}
-
-				hash := sha1.Sum(requestBuf)
-				if !bytes.Equal(hash[:], request.Hash[:]) {
-					log.Printf("Piece %d failed integrity check\n", request.Index)
+				if !peer.HasPiece(request.Index) {
 					requests <- request
 					continue
 				}
 
+				data, err := peer.DownloadPiece(conn, request.Index, request.Length, request.Hash)
+				if err != nil {
+					requests <- request
+					continue
+				}
 				havePayload := make([]byte, 4)
 				binary.BigEndian.PutUint32(havePayload, uint32(request.Index))
 				haveMsg := Message{
-					ID:      MsgHave,
+					ID:      MessageHave,
 					Payload: havePayload,
 				}
 				conn.Write(haveMsg.Serialize())
 				responses <- PieceResponce{
 					Index: request.Index,
-					Data:  requestBuf,
+					Data:  data,
 				}
 			}
 		}(peer, requests, responses)
@@ -607,5 +330,5 @@ func main() {
 	}
 	close(requests)
 	close(responses)
-	log.Printf("Success")
+	log.Printf("Successfully downloaded...")
 }
