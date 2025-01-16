@@ -105,6 +105,16 @@ type HaveMessage struct {
 	PieceIndex int
 }
 
+func ComposeHaveMessage(pieceIndex int) *Message {
+	payload := make([]byte, 4)
+	binary.BigEndian.PutUint32(payload, uint32(pieceIndex))
+	haveMsg := &Message{
+		ID:      MessageHave,
+		Payload: payload,
+	}
+	return haveMsg
+}
+
 func ParseHaveMessage(msg *Message) (*HaveMessage, error) {
 	if len(msg.Payload) != 4 {
 		return nil, fmt.Errorf("malformed msg %s payload must be 4 bytes", msg)

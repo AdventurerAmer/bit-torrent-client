@@ -69,14 +69,16 @@ func (p *Peer) ReadBitField(conn net.Conn, pieceCount int) error {
 	return nil
 }
 
-func (p Peer) SendUnchokeMessage(conn net.Conn) {
+func (p Peer) SendUnchokeMessage(conn net.Conn) error {
 	unchokeMsg := &Message{ID: MessageUnchoke}
-	conn.Write(unchokeMsg.Serialize())
+	_, err := conn.Write(unchokeMsg.Serialize())
+	return err
 }
 
-func (p Peer) SendInterestedMessage(conn net.Conn) {
+func (p Peer) SendInterestedMessage(conn net.Conn) error {
 	interestedMsg := &Message{ID: MessageInterested}
-	conn.Write(interestedMsg.Serialize())
+	_, err := conn.Write(interestedMsg.Serialize())
+	return err
 }
 
 func (p Peer) HasPiece(pieceIndex int) bool {
@@ -91,7 +93,7 @@ const MaxBlockSize = 16384
 const MaxBacklog = 5
 
 func (p *Peer) DownloadPiece(conn net.Conn, pieceIndex int, pieceLength int, pieceHash [20]byte) ([]byte, error) {
-	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	conn.SetDeadline(time.Now().Add(30 * time.Second))
 	defer conn.SetDeadline(time.Time{})
 
 	pieceData := make([]byte, pieceLength)
@@ -119,26 +121,28 @@ func (p *Peer) DownloadPiece(conn net.Conn, pieceIndex int, pieceLength int, pie
 		if err != nil {
 			return nil, err
 		}
-		switch msg.ID {
-		case MessageUnchoke:
-			p.Choked = false
-		case MessageChoke:
-			p.Choked = true
-		case MessageHave:
-			haveMsg, err := ParseHaveMessage(msg)
-			if err != nil {
-				log.Println(err)
-			} else {
-				p.SetPiece(haveMsg.PieceIndex)
-			}
-		case MessagePiece:
-			pieceMsg, err := ParsePieceMessage(msg, pieceIndex, pieceLength)
-			if err != nil {
-				log.Println(err)
-			} else {
-				copy(pieceData[pieceMsg.BlockOffset:], pieceMsg.BlockData)
-				downloaded += len(pieceMsg.BlockData)
-				backlog--
+		if msg != nil {
+			switch msg.ID {
+			case MessageUnchoke:
+				p.Choked = false
+			case MessageChoke:
+				p.Choked = true
+			case MessageHave:
+				haveMsg, err := ParseHaveMessage(msg)
+				if err != nil {
+					log.Println(err)
+				} else {
+					p.SetPiece(haveMsg.PieceIndex)
+				}
+			case MessagePiece:
+				pieceMsg, err := ParsePieceMessage(msg, pieceIndex, pieceLength)
+				if err != nil {
+					log.Println(err)
+				} else {
+					copy(pieceData[pieceMsg.BlockOffset:], pieceMsg.BlockData)
+					downloaded += len(pieceMsg.BlockData)
+					backlog--
+				}
 			}
 		}
 	}

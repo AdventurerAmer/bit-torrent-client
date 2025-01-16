@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha1"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -30,7 +31,7 @@ type Torrent struct {
 	InfoHash     [20]byte
 }
 
-func (t Torrent) GetPeers(peerID [20]byte, port int) []Peer {
+func (t Torrent) GetPeers(clientID [20]byte, port int) []Peer {
 	announceUrls := []string{t.Announce}
 	announceUrls = append(announceUrls, t.AnnounceList...)
 	peerSet := make(map[string]Peer)
@@ -44,7 +45,7 @@ func (t Torrent) GetPeers(peerID [20]byte, port int) []Peer {
 			}
 			params := url.Values{
 				"info_hash":  []string{string(t.InfoHash[:])},
-				"peer_id":    []string{string(peerID[:])},
+				"peer_id":    []string{string(clientID[:])},
 				"port":       []string{strconv.Itoa(port)},
 				"uploaded":   []string{"0"},
 				"downloaded": []string{"0"},
@@ -53,52 +54,55 @@ func (t Torrent) GetPeers(peerID [20]byte, port int) []Peer {
 			}
 			base.RawQuery = params.Encode()
 			trackerURL := base.String()
+			if base.Scheme == "http" || base.Scheme == "https" {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
 
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-
-			req, err := http.NewRequestWithContext(ctx, "GET", trackerURL, nil)
-			if err != nil {
-				log.Println(err)
-				return
-			}
-
-			resp, err := http.DefaultClient.Do(req)
-			if err != nil {
-				log.Println(err)
-				return
-			}
-
-			defer resp.Body.Close()
-			body, err := decodeBecoding(resp.Body)
-			if err != nil {
-				log.Println(err, resp.Body)
-				return
-			}
-			data, ok := body.(map[string]any)
-			if !ok {
-				log.Printf("expected a dictionary got %T", data)
-				return
-			}
-			peersStr, ok := data["peers"].(string)
-			if !ok {
-				log.Printf("missing \"peers\" key in %v", data)
-				return
-			}
-			// assuming ipv4 here
-			if len(peersStr)%6 != 0 {
-				log.Println("invalid peers string: len(peers) must be divisible by 6")
-				return
-			}
-			peerCount := len(peersStr) / 6
-			for i := 0; i < peerCount; i++ {
-				peerData := []byte(peersStr[i*6:])
-				peer := Peer{
-					IP:   net.IP(peerData[:4]),
-					Port: binary.BigEndian.Uint16(peerData[4:]),
+				req, err := http.NewRequestWithContext(ctx, "GET", trackerURL, nil)
+				if err != nil {
+					log.Println(err)
+					return
 				}
-				peerStr := fmt.Sprintf("%s:%d", peer.IP, peer.Port)
-				peerSet[peerStr] = peer
+
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					log.Println(err)
+					return
+				}
+
+				defer resp.Body.Close()
+				body, err := decodeBecoding(resp.Body)
+				if err != nil {
+					log.Println(err, resp.Body)
+					return
+				}
+				data, ok := body.(map[string]any)
+				if !ok {
+					log.Printf("expected a dictionary got %T", data)
+					return
+				}
+				peersStr, ok := data["peers"].(string)
+				if !ok {
+					log.Printf("missing \"peers\" key in %v", data)
+					return
+				}
+				// assuming ipv4 here
+				if len(peersStr)%6 != 0 {
+					log.Println("invalid peers string: len(peers) must be divisible by 6")
+					return
+				}
+				peerCount := len(peersStr) / 6
+				for i := 0; i < peerCount; i++ {
+					peerData := []byte(peersStr[i*6:])
+					peer := Peer{
+						IP:   net.IP(peerData[:4]),
+						Port: binary.BigEndian.Uint16(peerData[4:]),
+					}
+					peerStr := fmt.Sprintf("%s:%d", peer.IP, peer.Port)
+					peerSet[peerStr] = peer
+				}
+			} else {
+				// TODO: add support for uTP
 			}
 		}()
 	}
@@ -234,26 +238,91 @@ func generateClientID() ([20]byte, error) {
 	return clientID, nil
 }
 
+func handleClientPeer(torrent *Torrent, clientID [20]byte, peer Peer, requestsCh chan PieceRequest, responsesCh chan<- PieceResponce, retryCh chan<- string) {
+	defer func() {
+		retryCh <- peer.GetAddr()
+	}()
+	log.Printf("trying to connect to peer: %s", peer)
+	conn, err := net.DialTimeout("tcp", peer.GetAddr(), 5*time.Second)
+	if err != nil {
+		log.Printf("ecountered an error: %s with peer: %s\n", err, peer)
+		return
+	}
+	defer func() {
+		conn.Close()
+		log.Printf("peer: %s disconnected", peer)
+	}()
+
+	err = peer.ShakeHands(conn, torrent.InfoHash, clientID)
+	if err != nil {
+		log.Printf("ecountered an error: %s with peer: %s\n", err, peer)
+		return
+	}
+	log.Printf("Completed handshake with peer: %s\n", peer)
+
+	err = peer.ReadBitField(conn, len(torrent.Pieces))
+	if err != nil {
+		log.Printf("ecountered an error: %s with peer: %s\n", err, peer)
+		return
+	}
+	log.Printf("Got Bitfield from peer: %s\n", peer)
+
+	err = peer.SendUnchokeMessage(conn)
+	if err != nil {
+		log.Printf("ecountered an error: %s with peer: %s\n", err, peer)
+		return
+	}
+	err = peer.SendInterestedMessage(conn)
+	if err != nil {
+		log.Printf("ecountered an error: %s with peer: %s\n", err, peer)
+		return
+	}
+	for {
+		request, ok := <-requestsCh
+		if !ok {
+			break
+		}
+		if !peer.HasPiece(request.Index) {
+			requestsCh <- request
+			continue
+		}
+		data, err := peer.DownloadPiece(conn, request.Index, request.Length, request.Hash)
+		if err != nil {
+			// log.Println(err)
+			requestsCh <- request
+			continue
+		}
+
+		haveMsg := ComposeHaveMessage(request.Index)
+		_, err = conn.Write(haveMsg.Serialize())
+		if err != nil {
+			log.Println(err)
+			requestsCh <- request
+			continue
+		}
+		responsesCh <- PieceResponce{
+			Index: request.Index,
+			Data:  data,
+		}
+	}
+}
+
 func main() {
-	torrent, err := parseTorrentFile("sample.torrent")
+	torrent, err := parseTorrentFile("sample2.torrent")
 	if err != nil {
 		log.Fatal(err)
 	}
-	// fmt.Println("Info Hash:", hex.EncodeToString(torrent.InfoHash[:]))
-	// fmt.Println("Length", torrent.Length)
+	fmt.Println("Info Hash:", hex.EncodeToString(torrent.InfoHash[:]))
+	fmt.Println("Length:", torrent.Length)
 	clientID, err := generateClientID()
 	if err != nil {
 		log.Fatal(err)
 	}
+	fmt.Printf("Starting client %s\n", hex.EncodeToString(clientID[:]))
 
-	port := 6881 // clients will try 6881 to 6889 before giving up.
-	// fmt.Printf("Starting peer %s on port %d\n", hex.EncodeToString(peerID[:]), port)
-	peers := torrent.GetPeers(clientID, port)
-	if len(peers) == 0 {
-		log.Fatal("failed to get peers")
-	}
 	requests := make(chan PieceRequest, len(torrent.Pieces))
 	responses := make(chan PieceResponce, len(torrent.Pieces))
+
 	for i := 0; i < len(torrent.Pieces); i++ {
 		start := i * torrent.PieceLength
 		end := start + torrent.PieceLength
@@ -266,61 +335,37 @@ func main() {
 			Length: end - start,
 		}
 	}
-	for _, peer := range peers {
-		go func(peer Peer, requestCh chan PieceRequest, responses chan<- PieceResponce) {
-			conn, err := net.DialTimeout("tcp", peer.GetAddr(), 3*time.Second)
-			if err != nil {
-				log.Println(err)
-				return
+
+	done := make(chan struct{})
+
+	go func() {
+		peerSet := make(map[string]bool)
+		retryCh := make(chan string, 4096)
+		port := 6881 // clients will try to listen on ports 6881 to 6889 before giving up.
+		ticker := time.NewTicker(time.Second * 10)
+	loop:
+		for {
+			select {
+			case t := <-ticker.C:
+				log.Printf("checking for peers %v", t)
+				availablePeers := torrent.GetPeers(clientID, port)
+				for _, peer := range availablePeers {
+					ok := peerSet[peer.GetAddr()]
+					if !ok {
+						peerSet[peer.GetAddr()] = true
+						go handleClientPeer(torrent, clientID, peer, requests, responses, retryCh)
+					}
+				}
+			case r := <-retryCh:
+				log.Printf("peer %s added to retry queue\n", r)
+				delete(peerSet, r)
+			case <-done:
+				log.Printf("done")
+				break loop
 			}
-			defer conn.Close()
+		}
+	}()
 
-			err = peer.ShakeHands(conn, torrent.InfoHash, clientID)
-			if err != nil {
-				log.Println(err)
-				return
-			}
-			log.Printf("Completed handshake with peer: %s\n", peer)
-
-			err = peer.ReadBitField(conn, len(torrent.Pieces))
-			if err != nil {
-				log.Println(err)
-				return
-			}
-			log.Printf("Got Bitfield from peer: %s\n", peer)
-
-			peer.SendUnchokeMessage(conn)
-			peer.SendInterestedMessage(conn)
-
-			for {
-				request, ok := <-requests
-				if !ok {
-					break
-				}
-				if !peer.HasPiece(request.Index) {
-					requests <- request
-					continue
-				}
-
-				data, err := peer.DownloadPiece(conn, request.Index, request.Length, request.Hash)
-				if err != nil {
-					requests <- request
-					continue
-				}
-				havePayload := make([]byte, 4)
-				binary.BigEndian.PutUint32(havePayload, uint32(request.Index))
-				haveMsg := Message{
-					ID:      MessageHave,
-					Payload: havePayload,
-				}
-				conn.Write(haveMsg.Serialize())
-				responses <- PieceResponce{
-					Index: request.Index,
-					Data:  data,
-				}
-			}
-		}(peer, requests, responses)
-	}
 	downloadedPices := 0
 	for i := 0; i < len(torrent.Pieces); i++ {
 		resp := <-responses
@@ -330,5 +375,6 @@ func main() {
 	}
 	close(requests)
 	close(responses)
+	close(done)
 	log.Printf("Successfully downloaded...")
 }
