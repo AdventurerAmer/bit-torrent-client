@@ -8,12 +8,15 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -308,9 +311,69 @@ func handleClientPeer(torrent *Torrent, clientID [20]byte, peer Peer, requestsCh
 }
 
 func main() {
-	torrent, err := parseTorrentFile("sample2.torrent")
+	filePath := flag.String("file", "", "path of torrent file")
+	downloadPath := flag.String("path", ".", "download path")
+	flag.Parse()
+
+	err := os.MkdirAll(*downloadPath, os.ModeDir)
 	if err != nil {
 		log.Fatal(err)
+	}
+
+	torrent, err := parseTorrentFile(*filePath)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	files := []*os.File{}
+	defer func() {
+		for _, f := range files {
+			f.Close()
+		}
+	}()
+
+	if len(torrent.Files) == 0 {
+		filePath := path.Join(*downloadPath, torrent.Name)
+		file, err := os.OpenFile(filePath, os.O_CREATE, os.ModePerm)
+		if err != nil {
+			log.Fatal(err)
+		}
+		stat, err := file.Stat()
+		if err != nil {
+			log.Fatal(err)
+		}
+		if stat.Size() != int64(torrent.Length) {
+			err = file.Truncate(int64(torrent.Length))
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
+		files = append(files, file)
+	} else {
+		for _, fileEntry := range torrent.Files {
+			fileLength := fileEntry["length"].(int)
+			pathList := fileEntry["path"].([]any)
+			paths := make([]string, len(pathList))
+			for i, item := range pathList {
+				paths[i] = item.(string)
+			}
+			filePath := path.Join(*downloadPath, path.Join(paths...))
+			file, err := os.OpenFile(filePath, os.O_CREATE, os.ModePerm)
+			if err != nil {
+				log.Fatal(err)
+			}
+			stat, err := file.Stat()
+			if err != nil {
+				log.Fatal(err)
+			}
+			if stat.Size() != int64(fileLength) {
+				err = file.Truncate(int64(fileLength))
+				if err != nil {
+					log.Fatal(err)
+				}
+			}
+			files = append(files, file)
+		}
 	}
 	fmt.Println("Info Hash:", hex.EncodeToString(torrent.InfoHash[:]))
 	fmt.Println("Length:", torrent.Length)
@@ -322,17 +385,73 @@ func main() {
 
 	requests := make(chan PieceRequest, len(torrent.Pieces))
 	responses := make(chan PieceResponce, len(torrent.Pieces))
+	type FileRange struct {
+		file  *os.File
+		start int
+		end   int
+	}
+
+	calculatePieceLength := func(pieceIndex int) int {
+		pieceStart := pieceIndex * torrent.PieceLength
+		pieceEnd := pieceStart + torrent.PieceLength
+		if pieceEnd > torrent.Length {
+			pieceEnd = torrent.Length
+		}
+		return pieceEnd - pieceStart
+	}
+
+	ranges := make(map[int][]FileRange)
+	pieceIndex := 0
+	pieceLength := calculatePieceLength(0)
+
+	for _, file := range files {
+		stat, err := file.Stat()
+		if err != nil {
+			log.Fatal(err)
+		}
+		fileSize := int(stat.Size())
+		fileOffset := 0
+		for fileSize >= pieceLength {
+			fg := FileRange{file: file, start: fileOffset, end: fileOffset + pieceLength}
+			ranges[pieceIndex] = append(ranges[pieceIndex], fg)
+			pieceIndex++
+			fileOffset += pieceLength
+			fileSize -= pieceLength
+			pieceLength = calculatePieceLength(pieceIndex)
+		}
+		if fileSize != 0 && fileSize < pieceLength {
+			fg := FileRange{file: file, start: fileOffset, end: fileOffset + fileSize}
+			ranges[pieceIndex] = append(ranges[pieceIndex], fg)
+			pieceLength -= fileSize
+		}
+	}
+
+	downloadedPieces := 0
 
 	for i := 0; i < len(torrent.Pieces); i++ {
-		start := i * torrent.PieceLength
-		end := start + torrent.PieceLength
-		if end > torrent.Length {
-			end = torrent.Length
+		pieceLength := calculatePieceLength(i)
+		piece := make([]byte, pieceLength)
+		offset := 0
+		for _, r := range ranges[i] {
+			rangeLength := r.end - r.start
+			_, err := r.file.ReadAt(piece[offset:offset+rangeLength], int64(r.start))
+			offset += rangeLength
+			if err != nil {
+				if err != io.EOF {
+					log.Fatal(err)
+				}
+			}
+		}
+		pieceHash := sha1.Sum(piece)
+		if bytes.Equal(pieceHash[:], torrent.Pieces[i][:]) {
+			log.Printf("We have Piece %d\n", i)
+			downloadedPieces++
+			continue
 		}
 		requests <- PieceRequest{
 			Index:  i,
 			Hash:   torrent.Pieces[i],
-			Length: end - start,
+			Length: pieceLength,
 		}
 	}
 
@@ -366,11 +485,22 @@ func main() {
 		}
 	}()
 
-	downloadedPices := 0
-	for i := 0; i < len(torrent.Pieces); i++ {
+	downloadCount := len(torrent.Pieces) - downloadedPieces
+	for i := 0; i < downloadCount; i++ {
 		resp := <-responses
-		downloadedPices++
-		progress := float64(downloadedPices) / float64(len(torrent.Pieces)) * 100
+		downloadedPieces++
+		progress := float64(downloadedPieces) / float64(len(torrent.Pieces)) * 100
+		offset := 0
+		for _, r := range ranges[resp.Index] {
+			rangeLength := r.end - r.start
+			_, err := r.file.WriteAt(resp.Data[offset:offset+rangeLength], int64(r.start))
+			offset += rangeLength
+			if err != nil {
+				if err != io.EOF {
+					log.Fatal(err)
+				}
+			}
+		}
 		log.Printf("Downloaded Piece %d successfully progress %.2f%%", resp.Index, progress)
 	}
 	close(requests)
