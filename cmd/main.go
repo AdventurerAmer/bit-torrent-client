@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/sha1"
 	"encoding/binary"
 	"encoding/hex"
@@ -12,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -104,8 +104,151 @@ func (t Torrent) GetPeers(clientID [20]byte, port int) []Peer {
 					peerStr := fmt.Sprintf("%s:%d", peer.IP, peer.Port)
 					peerSet[peerStr] = peer
 				}
-			} else {
-				// TODO: add support for uTP
+			} else if base.Scheme == "udp" {
+				base, err := url.Parse(announceUrl)
+				if err != nil {
+					log.Println(err)
+					return
+				}
+				dialUrl := fmt.Sprintf("%s:%s", base.Hostname(), base.Port())
+				serverAddr, err := net.ResolveUDPAddr("udp", dialUrl)
+				if err != nil {
+					log.Println(err)
+					return
+				}
+				localAddr := &net.UDPAddr{
+					IP:   net.IPv4zero,
+					Port: 0,
+				}
+				conn, err := net.DialUDP("udp", localAddr, serverAddr)
+				if err != nil {
+					log.Println(err)
+					return
+				}
+				defer conn.Close()
+				sendRecv := func(req []byte, resp []byte, timeout time.Duration) bool {
+					// n := 0
+					// waitTime := 15 * int(math.Floor(math.Pow(2.0, float64(n))))
+					_, err := conn.Write(req)
+					if err != nil {
+						log.Println(err)
+						return false
+					}
+					conn.SetReadDeadline(time.Now().Add(timeout))
+					defer conn.SetReadDeadline(time.Time{})
+					_, err = conn.Read(resp)
+					if err != nil {
+						log.Println(err)
+						return false
+					}
+					return true
+				}
+				// connect request response
+				req := make([]byte, 16)
+				transactionID := rand.Uint32()
+				binary.BigEndian.PutUint64(req[:8], 0x41727101980)
+				binary.BigEndian.PutUint32(req[8:12], 0)
+				binary.BigEndian.PutUint32(req[12:16], uint32(transactionID))
+
+				res := make([]byte, 16)
+				recived := sendRecv(req, res, 5*time.Second)
+				if !recived {
+					log.Println("timeout")
+					return
+				}
+				action := binary.BigEndian.Uint32(res[:4])
+				tid := binary.BigEndian.Uint32(res[4:8])
+				connectionID := binary.BigEndian.Uint64(res[8:])
+				if action != 0 {
+					log.Printf("action should be 0 got %d\n", action)
+					return
+				}
+				if tid != transactionID {
+					log.Printf("transation id mismatch send %d got %d\n", transactionID, tid)
+					return
+				}
+				log.Printf("connected to udp tracker %d\n", connectionID)
+				// connect request response
+				// Offset  Size    Name    Value
+				// 0       64-bit integer  connection_id
+				// 8       32-bit integer  action          1 // announce
+				// 12      32-bit integer  transaction_id
+				// 16      20-byte string  info_hash
+				// 36      20-byte string  peer_id
+				// 56      64-bit integer  downloaded
+				// 64      64-bit integer  left
+				// 72      64-bit integer  uploaded
+				// 80      32-bit integer  event           0 // 0: none; 1: completed; 2: started; 3: stopped
+				// 84      32-bit integer  IP address      0 // default
+				// 88      32-bit integer  key
+				// 92      32-bit integer  num_want        -1 // default
+				// 96      16-bit integer  port
+				// 98
+				transactionID = rand.Uint32()
+				action = 1 // announce
+				var r bytes.Buffer
+				binary.Write(&r, binary.BigEndian, connectionID)
+				binary.Write(&r, binary.BigEndian, action)
+				binary.Write(&r, binary.BigEndian, transactionID)
+				r.Write(t.InfoHash[:])
+				r.Write(clientID[:])
+				downloaded := uint64(0)
+				binary.Write(&r, binary.BigEndian, downloaded)
+				left := uint64(t.Length)
+				binary.Write(&r, binary.BigEndian, left)
+				uploaded := uint64(0)
+				binary.Write(&r, binary.BigEndian, uploaded)
+				event := uint32(0)
+				binary.Write(&r, binary.BigEndian, event)
+				ip := uint32(0)
+				binary.Write(&r, binary.BigEndian, ip)
+				key := uint32(0)
+				binary.Write(&r, binary.BigEndian, key)
+				numWant := int32(-1)
+				binary.Write(&r, binary.BigEndian, numWant)
+				binary.Write(&r, binary.BigEndian, uint16(port))
+				res = make([]byte, 4096)
+				sendRecv(r.Bytes(), res, 5*time.Second)
+				if !recived {
+					log.Println("timeout")
+					return
+				}
+				// Offset      Size            Name            Value
+				// 0           32-bit integer  action          1 // announce
+				// 4           32-bit integer  transaction_id
+				// 8           32-bit integer  interval
+				// 12          32-bit integer  leechers
+				// 16          32-bit integer  seeders
+				// 20 + 6 * n  32-bit integer  IP address
+				// 24 + 6 * n  16-bit integer  TCP port
+				// 20 + 6 * N
+				action = binary.BigEndian.Uint32(res[:4])
+				if action != 1 {
+					log.Printf("action should be 1 got %d\n", action)
+					return
+				}
+				tid = binary.BigEndian.Uint32(res[4:8])
+				if tid != transactionID {
+					log.Printf("transation id mismatch send %d got %d\n", transactionID, tid)
+					return
+				}
+				interval := binary.BigEndian.Uint32(res[8:12])
+				_ = interval
+				leechers := binary.BigEndian.Uint32(res[12:16])
+				_ = leechers
+				seeders := binary.BigEndian.Uint32(res[16:20])
+				data := res[20:]
+				for i := 0; i < int(seeders); i++ {
+					ip := data[i*6 : i*6+4]
+					port := binary.BigEndian.Uint16(data[i*6+4 : i*6+6])
+					peer := Peer{
+						IP:   net.IPv4(ip[0], ip[1], ip[2], ip[3]),
+						Port: port,
+					}
+					peerStr := fmt.Sprintf("%s:%d", peer.IP, peer.Port)
+					peerSet[peerStr] = peer
+					log.Printf("Got Peer %s from Tracker %d\n", peer.String(), connectionID)
+				}
 			}
 		}()
 	}
