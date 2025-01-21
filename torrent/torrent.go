@@ -251,26 +251,14 @@ func fetchPeersUDP(u url.URL, t Torrent, clientID [20]byte, port int, urls chan<
 		urls <- u
 	}()
 	dialUrl := fmt.Sprintf("%s:%s", u.Hostname(), u.Port())
-	serverAddr, err := net.ResolveUDPAddr("udp", dialUrl)
-
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
-	localAddr := &net.UDPAddr{
-		IP:   net.IPv4zero,
-		Port: 0,
-	}
-
-	conn, err := net.DialUDP("udp", localAddr, serverAddr)
+	conn, err := net.DialTimeout("udp", dialUrl, 10*time.Second)
 	if err != nil {
 		log.Println(err)
 		return
 	}
 	defer conn.Close()
 
-	sendRecv := func(req []byte, resp []byte) {
+	sendRecv := func(req []byte, res []byte) {
 		n := 0
 		sent := false
 		for !sent {
@@ -286,7 +274,7 @@ func fetchPeersUDP(u url.URL, t Torrent, clientID [20]byte, port int, urls chan<
 				conn.SetReadDeadline(now.Add(time.Duration(timeout) * time.Second))
 				defer conn.SetReadDeadline(time.Time{})
 
-				_, err = conn.Read(resp)
+				_, err = conn.Read(res)
 
 				if err != nil {
 					log.Println(err)
