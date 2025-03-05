@@ -6,7 +6,9 @@
 
 ## Goal
 
-	The goal of the project was to practice Golang’s concurrency along the way, I learned a ton about network programming with the TCP protocol, the bencode encoding, the BitTorrent protocol, and the peer-to-peer architecture.
+	The goal of the project was to practice Golang’s concurrency along the way,
+    I learned a ton about network programming with the TCP protocol, the bencode encoding,
+    the BitTorrent protocol, and the peer-to-peer architecture.
 
 ## Features
 
