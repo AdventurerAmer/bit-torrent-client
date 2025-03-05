@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -20,14 +21,19 @@ import (
 	"time"
 )
 
+type MetaData struct {
+	Length      int
+	Files       []FileInfo
+	PieceLength int
+	Pieces      [][20]byte
+}
+
 type Torrent struct {
+	MetaData
 	AnnounceUrls []string
 	Name         string
-	Length       int
 	InfoHash     [20]byte
-	Files        []FileInfo
-	PieceLength  int
-	Pieces       [][20]byte
+	InfoCh       chan MetaData
 }
 
 type FileInfo struct {
@@ -35,7 +41,7 @@ type FileInfo struct {
 	Path   string
 }
 
-func Parse(filepath string) (*Torrent, error) {
+func ParseFile(filepath string) (*Torrent, error) {
 	p, err := os.ReadFile(filepath)
 	if err != nil {
 		return nil, err
@@ -149,12 +155,64 @@ func Parse(filepath string) (*Torrent, error) {
 	t := &Torrent{
 		AnnounceUrls: announceUrls,
 		Name:         name,
-		Length:       length,
-		Files:        files,
-		PieceLength:  pieceLength,
-		Pieces:       pieces,
-		InfoHash:     infoHash,
+		MetaData: MetaData{
+			Length:      length,
+			Files:       files,
+			PieceLength: pieceLength,
+			Pieces:      pieces,
+		},
+		InfoHash: infoHash,
+		InfoCh:   make(chan MetaData),
 	}
+	return t, nil
+}
+
+func ParseMagnet(magnet string) (*Torrent, error) {
+	u, err := url.Parse(magnet)
+	if err != nil {
+		return nil, err
+	}
+	query := u.Query()
+
+	xt := query.Get("xt")
+	if xt == "" {
+		return nil, errors.New("invalid magnet link: missing xt")
+	}
+	parts := strings.Split(xt, ":")
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("invalid magnet link: unsupported extact topic %v", xt)
+	}
+	if parts[0] != "urn" {
+		return nil, fmt.Errorf("invalid magnet link: unsupported extact topic %v", xt)
+	}
+
+	if parts[1] != "btih" && parts[1] != "btmh" {
+		return nil, fmt.Errorf("invalid magnet link: unsupported extact topic %v", xt)
+	}
+	infoHash, err := hex.DecodeString(parts[2])
+	if err != nil {
+		return nil, err
+	}
+	log.Println("infoHash", string(infoHash))
+	name := query.Get("dn")
+	if name == "" {
+		return nil, errors.New("invalid magnet link: missing name (dn)")
+	}
+	trackers := query["tr"]
+	if len(trackers) == 0 {
+		return nil, errors.New("invalid magnet link: missing trackers (tr)")
+	}
+	t := &Torrent{
+		AnnounceUrls: trackers,
+		Name:         name,
+		// Length:       length,
+		// Files:        files,
+		// PieceLength:  pieceLength,
+		// Pieces:       pieces,
+		InfoHash: [20]byte(infoHash),
+		InfoCh:   make(chan MetaData),
+	}
+	log.Printf("torrent: %v", t)
 	return t, nil
 }
 
@@ -349,7 +407,7 @@ func fetchPeersUDP(u url.URL, t Torrent, clientID [20]byte, port int, urls chan<
 	numWant := int32(-1)
 	binary.Write(&r, binary.BigEndian, numWant)
 	binary.Write(&r, binary.BigEndian, uint16(port))
-	res = make([]byte, 4096)
+	res = make([]byte, 8096)
 	sendRecv(r.Bytes(), res)
 	// Offset      Size            Name            Value
 	// 0           32-bit integer  action          1 // announce

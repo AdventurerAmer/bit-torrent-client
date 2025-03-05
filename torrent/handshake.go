@@ -24,6 +24,7 @@ func (h *Handshake) Serialize() []byte {
 	b.WriteByte(byte(len(h.Str)))
 	b.Write([]byte(h.Str))
 	extensions := make([]byte, 8)
+	extensions[5] = 0x10
 	b.Write(extensions)
 	b.Write(h.InfoHash[:])
 	b.Write(h.ID[:])

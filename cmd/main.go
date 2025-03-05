@@ -4,15 +4,29 @@ import (
 	"flag"
 	"log"
 
-	"github.com/harlequingg/bit-torrent-client/torrent"
+	"github.com/AdventurerAmer/bit-torrent-client/torrent"
 )
 
 func main() {
+
+	log.SetFlags(log.LUTC | log.Llongfile)
+
 	filePath := flag.String("file", "", "path of torrent file")
+	magnet := flag.String("magnet", "", "magnet link")
 	downloadPath := flag.String("path", ".", "download path")
 	flag.Parse()
 
-	t, err := torrent.Parse(*filePath)
+	var (
+		t   *torrent.Torrent
+		err error
+	)
+
+	if *magnet != "" {
+		t, err = torrent.ParseMagnet(*magnet)
+	} else {
+		t, err = torrent.ParseFile(*filePath)
+	}
+
 	if err != nil {
 		log.Fatal(err)
 	}

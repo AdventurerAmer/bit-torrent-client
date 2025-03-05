@@ -44,28 +44,21 @@ func (p *Peer) ShakeHands(conn net.Conn, infoHash [20]byte, ID [20]byte) error {
 	return nil
 }
 
-func (p *Peer) ReadBitField(conn net.Conn, pieceCount int) error {
-	msg, err := ReadMessage(conn)
-	if err != nil {
-		return err
-	}
-	if msg == nil {
-		return fmt.Errorf("invalid bitfield message from peer %s got a nil message", p)
-	}
-	if msg.ID != MessageBitfield {
-		return fmt.Errorf("invalid bitfield message from peer %s got %s", p, msg)
-	}
+func (p *Peer) HandleBitFieldMessage(msg *Message, pieceCount int) error {
+	p.bf = BitField(msg.Payload)
+	return nil
+}
 
+func (p *Peer) IsBitFieldValid(pieceCount int) error {
 	payloadLength := pieceCount
 	remainder := pieceCount % 8
 	if remainder != 0 {
 		payloadLength += (8 - remainder)
 	}
 
-	if len(msg.Payload)*8 != payloadLength {
-		return fmt.Errorf("invalid bitfield message from peer %s: payload must be of length %d but got %d", p, pieceCount, payloadLength)
+	if len(p.bf)*8 != payloadLength {
+		return fmt.Errorf("invalid bitfield message from peer %s: payload must be of length %d but got %d", p, payloadLength, len(p.bf)*8)
 	}
-	p.bf = BitField(msg.Payload)
 	return nil
 }
 

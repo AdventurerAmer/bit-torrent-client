@@ -2,17 +2,20 @@ package torrent
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/url"
 	"os"
 	"path"
+	"strings"
 	"time"
+
+	"github.com/anacrolix/utp"
 )
 
 type Downloader struct {
@@ -36,6 +39,50 @@ func (d *Downloader) Download(downloadPath string) error {
 		return err
 	}
 	fmt.Printf("Starting downloader with id: %s\n", hex.EncodeToString(clientID[:]))
+
+	var (
+		requests  = make(chan pieceRequest, 4096)
+		responses = make(chan pieceResponce, 4096)
+	)
+	go func() {
+		peerSet := make(map[string]bool)
+		peersCh := make(chan Peer, 4096)
+		urlsCh := make(chan url.URL, len(d.Torrent.AnnounceUrls))
+		retryPeerCh := make(chan string, 4096)
+		for _, u := range d.Torrent.AnnounceUrls {
+			base, err := url.Parse(u)
+			if err != nil {
+				log.Println(err)
+				continue
+			}
+			urlsCh <- *base
+		}
+		port := 6881 // clients will try to listen on ports 6881 to 6889 before giving up.
+	loop:
+		for {
+			select {
+			case u := <-urlsCh:
+				d.Torrent.FetchPeers(u, clientID, port, urlsCh, peersCh)
+			case p := <-peersCh:
+				key := p.GetAddr()
+				ok := peerSet[key]
+				if !ok {
+					peerSet[key] = true
+					go handlePeer(d.Torrent, clientID, p, requests, responses, retryPeerCh)
+				}
+			case r := <-retryPeerCh:
+				delete(peerSet, r)
+			case <-d.Done:
+				break loop
+			}
+		}
+	}()
+
+	md := <-d.Torrent.InfoCh
+	d.Torrent.InfoCh = nil
+	d.Torrent.MetaData = md
+
+	log.Println("Got Info...")
 
 	for _, info := range d.Torrent.Files {
 		filePath := path.Join(downloadPath, info.Path)
@@ -89,8 +136,6 @@ func (d *Downloader) Download(downloadPath string) error {
 		}
 	}
 
-	requests := make(chan pieceRequest, len(d.Torrent.Pieces))
-	responses := make(chan pieceResponce, len(d.Torrent.Pieces))
 	downloadedPieces := 0
 
 	for i := 0; i < len(d.Torrent.Pieces); i++ {
@@ -123,40 +168,6 @@ func (d *Downloader) Download(downloadPath string) error {
 
 	piecesToDownload := len(d.Torrent.Pieces) - downloadedPieces
 	d.Progress = make(chan float64, piecesToDownload)
-
-	go func() {
-		peerSet := make(map[string]bool)
-		peersCh := make(chan Peer, 4096)
-		urlsCh := make(chan url.URL, len(d.Torrent.AnnounceUrls))
-		retryPeerCh := make(chan string, 4096)
-		for _, u := range d.Torrent.AnnounceUrls {
-			base, err := url.Parse(u)
-			if err != nil {
-				log.Println(err)
-				continue
-			}
-			urlsCh <- *base
-		}
-		port := 6881 // clients will try to listen on ports 6881 to 6889 before giving up.
-	loop:
-		for {
-			select {
-			case u := <-urlsCh:
-				d.Torrent.FetchPeers(u, clientID, port, urlsCh, peersCh)
-			case p := <-peersCh:
-				key := p.GetAddr()
-				ok := peerSet[key]
-				if !ok {
-					peerSet[key] = true
-					go handlePeer(d.Torrent, clientID, p, requests, responses, retryPeerCh)
-				}
-			case r := <-retryPeerCh:
-				delete(peerSet, r)
-			case <-d.Done:
-				break loop
-			}
-		}
-	}()
 
 	go func(downloadedPieces int, piecesToDownload int) {
 	loop:
@@ -225,7 +236,11 @@ func handlePeer(t *Torrent, clientID [20]byte, peer Peer, requestsCh chan pieceR
 	defer func() {
 		retryCh <- peer.GetAddr()
 	}()
-	conn, err := net.DialTimeout("tcp", peer.GetAddr(), 10*time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	conn, err := utp.DialContext(ctx, peer.GetAddr())
+
 	if err != nil {
 		log.Printf("failed to connect to peer %s: %s\n", peer, err)
 		return
@@ -240,12 +255,223 @@ func handlePeer(t *Torrent, clientID [20]byte, peer Peer, requestsCh chan pieceR
 		log.Printf("ecountered an error with peer %s: %s\n", peer, err)
 		return
 	}
-
-	err = peer.ReadBitField(conn, len(t.Pieces))
+	request := "d1:md11:ut_metadatai2ee13:metadata_sizei0ee"
+	extendedHandShake := NewExtendedMessage(0, []byte(request))
+	_, err = conn.Write(extendedHandShake.Serialize())
 	if err != nil {
-		log.Printf("ecountered an error with peer %s: %s\n", peer, err)
 		return
 	}
+	var utMetadataID int
+	var metaDataSize int
+loop0:
+	for {
+		msg, err := ReadMessage(conn)
+		if err != nil {
+			log.Println(err)
+			return
+		}
+		if msg == nil {
+			continue
+		}
+		switch msg.ID {
+		case MessageBitfield:
+			err = peer.HandleBitFieldMessage(msg, len(t.Pieces))
+			if err != nil {
+				log.Printf("ecountered an error with peer %s: %s\n", peer, err)
+				return
+			}
+		case MessageExtended:
+			extended := ConvertMessageToExtended(msg)
+			if extended.Extension != 0 {
+				log.Printf("ecountered an error with peer %s: extention must be zero\n", peer)
+				return
+			}
+			shake, err := decodeBecoding(strings.NewReader(string(extended.Payload)))
+			if err != nil {
+				return
+			}
+			root, ok := shake.(map[string]any)
+			if !ok {
+				return
+			}
+			metaDataSize, ok = root["metadata_size"].(int)
+			if !ok {
+				return
+			}
+			m, ok := root["m"].(map[string]any)
+			if !ok {
+				return
+			}
+			utMetadataID, ok = m["ut_metadata"].(int)
+			if !ok {
+				return
+			}
+			break loop0
+		}
+	}
+
+	const PieceSize = 16384
+	metadataPieces := make([][]byte, (metaDataSize+PieceSize-1)/PieceSize)
+	log.Println(peer, "Meta Data Piece Count:", len(metadataPieces))
+
+	metaDataPieceCount := 0
+	for i := 0; i < len(metadataPieces); i++ {
+	loop1:
+		for {
+			{
+				payload := fmt.Sprintf("d8:msg_typei0e5:piecei%dee", i)
+				msg := NewExtendedMessage(byte(utMetadataID), []byte(payload))
+				_, err := conn.Write(msg.Serialize())
+				if err != nil {
+					log.Println(err)
+					continue
+				}
+			}
+			{
+				msg, err := ReadMessage(conn)
+				if err != nil {
+					log.Println(err)
+					return
+				}
+				if msg == nil {
+					continue
+				}
+				switch msg.ID {
+				case MessageBitfield:
+					err = peer.HandleBitFieldMessage(msg, len(t.Pieces))
+					if err != nil {
+						log.Printf("ecountered an error with peer %s: %s\n", peer, err)
+						return
+					}
+				case MessageExtended:
+					extended := ConvertMessageToExtended(msg)
+					if extended.Extension != byte(utMetadataID) {
+						break
+					}
+					data, err := decodeBecoding(strings.NewReader(string(extended.Payload)))
+					if err != nil {
+						log.Printf("ecountered an error with peer %s: %s\n", peer, err)
+						break
+					}
+					m, ok := data.(map[string]any)
+					if !ok {
+						break
+					}
+					msgType, ok := m["msg_type"].(int)
+					if !ok {
+						log.Println("msg_type not found")
+						break
+					}
+					pieceIndex, ok := m["piece"].(int)
+					if !ok {
+						log.Println("piece not found")
+						break
+					}
+					if pieceIndex != i {
+						break
+					}
+					if msgType == 1 {
+						log.Printf("Peer %v Got MetaData Piece %v\n", peer, pieceIndex)
+						s := fmt.Sprintf("d8:msg_typei1e5:piecei%de10:total_sizei%dee", pieceIndex, metaDataSize)
+						pieceData := extended.Payload[len(s):]
+						metadataPieces[pieceIndex] = pieceData
+						metaDataPieceCount++
+					} else if msgType == 2 {
+						log.Printf("Peer %v MetaData Piece %v got rejected", peer, pieceIndex)
+					}
+					break loop1
+				}
+			}
+		}
+	}
+
+	if metaDataPieceCount != len(metadataPieces) {
+		return
+	}
+	metaData := make([]byte, metaDataSize)
+	for i := 0; i < len(metadataPieces); i++ {
+		copy(metaData[i*PieceSize:], metadataPieces[i])
+	}
+	m, err := decodeBecoding(strings.NewReader(string(metaData)))
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+	info := m.(map[string]any)
+	name, ok := info["name"].(string)
+	if !ok {
+		log.Println("name is not found...")
+		return
+	}
+
+	files := []FileInfo{}
+
+	length, ok := info["length"].(int)
+	if ok { // single file case
+		files = append(files, FileInfo{Length: length, Path: name})
+	} else { // multiple files case
+		filesList, ok := info["files"].([]any)
+		if !ok {
+			log.Println(`invalid torrent file: missing both "length" and "files" keys info dictionary`)
+		}
+		for idx, fileMap := range filesList {
+			file, ok := fileMap.(map[string]any)
+			if !ok {
+				log.Printf(`invalid torrent file: file number %d must be of type map[string]any`, idx)
+			}
+			fileLength, ok := file["length"].(int)
+			if !ok {
+				log.Printf(`invalid torrent file: "length" key of file number %d must be an int`, idx)
+			}
+			length += fileLength
+
+			pathList := file["path"].([]any)
+			paths := make([]string, len(pathList))
+			for i, item := range pathList {
+				paths[i] = item.(string)
+			}
+			info := FileInfo{Length: fileLength, Path: path.Join(paths...)}
+			files = append(files, info)
+		}
+	}
+
+	pieceLength, ok := info["piece length"].(int)
+	if !ok {
+		log.Println("invalid torrent file: type mismatch value of key \"piece length\" in info dictionary must a int")
+		return
+	}
+
+	piecesStr, ok := info["pieces"].(string)
+	if !ok {
+		log.Println("invalid torrent file: type mismatch value of key \"pieces\" in info dictionary must a string")
+		return
+	}
+
+	if len(piecesStr)%20 != 0 {
+		log.Println("invalid torrent file: size of pieces hashes string must be divisable by 20")
+		return
+	}
+
+	pieceCount := len(piecesStr) / 20
+	pieces := make([][20]byte, pieceCount)
+	for i := 0; i < pieceCount; i++ {
+		copy(pieces[i][:], piecesStr[i*20:i*20+20])
+	}
+	md := MetaData{
+		Length:      length,
+		Files:       files,
+		PieceLength: pieceLength,
+		Pieces:      pieces,
+	}
+
+	select {
+	case t.InfoCh <- md:
+		log.Println(peer, "Sending Meta Info")
+	case <-t.InfoCh:
+		log.Println(peer, "Already Read")
+	}
+	log.Println(peer, "Ready to download")
 
 	err = peer.SendUnchokeMessage(conn)
 	if err != nil {

@@ -19,6 +19,7 @@ const (
 	MessageRequest
 	MessagePiece
 	MessageCancel
+	MessageExtended = 20
 )
 
 type Message struct {
@@ -26,14 +27,39 @@ type Message struct {
 	Payload []byte
 }
 
+type ExtendedMessage struct {
+	ID        MessageID
+	Extension byte
+	Payload   []byte
+}
+
+func NewExtendedMessage(extensionID byte, payload []byte) *ExtendedMessage {
+	return &ExtendedMessage{
+		ID:        MessageExtended,
+		Extension: extensionID,
+		Payload:   payload,
+	}
+}
+
+func (e *ExtendedMessage) Serialize() []byte {
+	if e == nil {
+		return make([]byte, 4)
+	}
+	var b bytes.Buffer
+	length := uint32(2 + len(e.Payload))
+	binary.Write(&b, binary.BigEndian, length)
+	b.WriteByte(byte(e.ID))
+	b.WriteByte(byte(e.Extension))
+	b.Write(e.Payload)
+	return b.Bytes()
+}
+
 func (m *Message) Serialize() []byte {
 	if m == nil {
 		return make([]byte, 4)
 	}
 	var b bytes.Buffer
-	length := make([]byte, 4)
-	binary.BigEndian.PutUint32(length, uint32(len(m.Payload)+1))
-	b.Write(length)
+	binary.Write(&b, binary.BigEndian, uint32(len(m.Payload)+1))
 	b.WriteByte(byte(m.ID))
 	b.Write(m.Payload)
 	return b.Bytes()
@@ -62,18 +88,19 @@ func (m *Message) String() string {
 		return "Piece"
 	case MessageCancel:
 		return "Cancel"
+	case MessageExtended:
+		return "Extended"
 	default:
 		return "Unkown"
 	}
 }
 
 func ReadMessage(r io.Reader) (*Message, error) {
-	lengthBuf := make([]byte, 4)
-	_, err := io.ReadFull(r, lengthBuf)
+	var length uint32
+	err := binary.Read(r, binary.BigEndian, &length)
 	if err != nil {
 		return nil, err
 	}
-	length := binary.BigEndian.Uint32(lengthBuf)
 	// keep-alive message
 	if length == 0 {
 		return nil, nil
@@ -88,6 +115,14 @@ func ReadMessage(r io.Reader) (*Message, error) {
 		Payload: buf[1:],
 	}
 	return msg, nil
+}
+
+func ConvertMessageToExtended(msg *Message) *ExtendedMessage {
+	return &ExtendedMessage{
+		ID:        msg.ID,
+		Extension: msg.Payload[0],
+		Payload:   msg.Payload[1:],
+	}
 }
 
 func ComposeRequestMessage(pieceIndex, offset, blockSize int) *Message {
