@@ -2,7 +2,10 @@ module github.com/AdventurerAmer/bit-torrent-client
 
 go 1.23.2
 
-require github.com/anacrolix/utp v0.2.0
+require (
+	github.com/anacrolix/utp v0.2.0
+	github.com/jackpal/bencode-go v1.0.2
+)
 
 require (
 	github.com/anacrolix/missinggo v1.3.0 // indirect

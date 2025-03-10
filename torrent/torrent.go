@@ -18,8 +18,16 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	bencode "github.com/jackpal/bencode-go"
 )
+
+type FileInfo struct {
+	Length int
+	Path   string
+}
 
 type MetaData struct {
 	Length      int
@@ -30,15 +38,30 @@ type MetaData struct {
 
 type Torrent struct {
 	MetaData
-	AnnounceUrls []string
-	Name         string
-	InfoHash     [20]byte
-	InfoCh       chan MetaData
+	AnnounceUrls     []string
+	Name             string
+	InfoHash         [20]byte
+	MetaDataSignaled bool
+	MetaDataCond     sync.Cond
 }
 
-type FileInfo struct {
-	Length int
-	Path   string
+type TorrentFileInfo struct {
+	Length int      `bencode:"length"`
+	Path   []string `bencode:"path"`
+}
+
+type TorrentInfo struct {
+	Length      int               `bencode:"length,omitempty"`
+	Name        string            `bencode:"name"`
+	Files       []TorrentFileInfo `bencode:"files,omitempty"`
+	PieceLength int               `bencode:"piece length"`
+	Pieces      string            `bencode:"pieces"`
+}
+
+type TorrentMetaInfo struct {
+	Announce     string      `bencode:"announce"`
+	AnnounceList [][]string  `bencode:"announce-list"`
+	Info         TorrentInfo `bencode:"info"`
 }
 
 func ParseFile(filepath string) (*Torrent, error) {
@@ -47,122 +70,72 @@ func ParseFile(filepath string) (*Torrent, error) {
 		return nil, err
 	}
 
-	data, err := decodeBecoding(bytes.NewReader(p))
+	metaInfo := TorrentMetaInfo{}
+	err = bencode.Unmarshal(bytes.NewReader(p), &metaInfo)
 	if err != nil {
 		return nil, err
 	}
 
-	metainfo, ok := data.(map[string]any)
-	if !ok {
-		return nil, errors.New("invalid torrent file: missing \"metainfo\" map")
+	announceUrls := []string{metaInfo.Announce}
+	for _, tier := range metaInfo.AnnounceList {
+		announceUrls = append(announceUrls, tier...)
 	}
 
-	announce, ok := metainfo["announce"].(string)
-	if !ok {
-		return nil, errors.New("invalid torrent file: missing \"announce\" key")
-	}
+	info := metaInfo.Info
 
-	announceUrls := []string{announce}
-	announceList, ok := metainfo["announce-list"].([]any)
+	length := 0
+	var files []FileInfo
 
-	if ok {
-		for listIndex, list := range announceList {
-			items, ok := list.([]any)
-			if !ok {
-				return nil, fmt.Errorf(`invalid torrent file: type mismatch at key "announce-list" at index: %d expected []any got %T`, listIndex, items)
-			}
-			for itemIndex, item := range items {
-				strItem, ok := item.(string)
-				if !ok {
-					return nil, fmt.Errorf(`invalid torrent file: type mismatch at key "announce-list" at index: %d expected string got %T`, itemIndex, item)
-				}
-				announceUrls = append(announceUrls, strItem)
-			}
+	if info.Length != 0 && len(info.Files) == 0 {
+		length = info.Length
+		files = []FileInfo{{Length: length, Path: info.Name}}
+	} else {
+		for _, file := range info.Files {
+			length += file.Length
+			fileInfo := FileInfo{Length: file.Length, Path: path.Join(file.Path...)}
+			files = append(files, fileInfo)
 		}
 	}
 
-	info, ok := metainfo["info"].(map[string]any)
-	if !ok {
-		return nil, errors.New("invalid torrent file: type mismatch \"info\" key must a dictionary")
-	}
-
-	name := info["name"].(string)
-	if !ok {
-		return nil, errors.New("invalid torrent file: type mismatch value of key \"name\" in info dictionary must a string")
-	}
-
-	files := []FileInfo{}
-
-	length, ok := info["length"].(int)
-	if ok { // single file case
-		files = append(files, FileInfo{Length: length, Path: name})
-	} else { // multiple files case
-		filesList, ok := info["files"].([]any)
-		if !ok {
-			return nil, errors.New(`invalid torrent file: missing both "length" and "files" keys info dictionary`)
-		}
-		for idx, fileMap := range filesList {
-			file, ok := fileMap.(map[string]any)
-			if !ok {
-				return nil, fmt.Errorf(`invalid torrent file: file number %d must be of type map[string]any`, idx)
-			}
-			fileLength, ok := file["length"].(int)
-			if !ok {
-				return nil, fmt.Errorf(`invalid torrent file: "length" key of file number %d must be an int`, idx)
-			}
-			length += fileLength
-
-			pathList := file["path"].([]any)
-			paths := make([]string, len(pathList))
-			for i, item := range pathList {
-				paths[i] = item.(string)
-			}
-			info := FileInfo{Length: fileLength, Path: path.Join(paths...)}
-			files = append(files, info)
-		}
-	}
-
-	pieceLength, ok := info["piece length"].(int)
-	if !ok {
-		return nil, errors.New("invalid torrent file: type mismatch value of key \"piece length\" in info dictionary must a int")
-	}
-
-	piecesStr, ok := info["pieces"].(string)
-	if !ok {
-		return nil, errors.New("invalid torrent file: type mismatch value of key \"pieces\" in info dictionary must a string")
-	}
-
-	if len(piecesStr)%20 != 0 {
+	if len(info.Pieces)%20 != 0 {
 		return nil, errors.New("invalid torrent file: size of pieces hashes string must be divisable by 20")
 	}
 
-	pieceCount := len(piecesStr) / 20
+	pieceCount := len(info.Pieces) / 20
 	pieces := make([][20]byte, pieceCount)
 	for i := 0; i < pieceCount; i++ {
-		copy(pieces[i][:], piecesStr[i*20:i*20+20])
+		copy(pieces[i][:], info.Pieces[i*20:i*20+20])
 	}
 
-	infoLiteral := "4:info"
-	idx := strings.Index(string(p), infoLiteral)
-	s := string(p[idx+len(infoLiteral):])
-	_, remaining, _ := decode(s)
-	infoStr := s[:len(s)-len(remaining)]
+	infoLiteral := []byte("4:info")
+	infoIdx := bytes.Index(p, infoLiteral)
+	infoData, err := bencode.Decode(bytes.NewReader(p[infoIdx+len(infoLiteral):]))
+	if err != nil {
+		return nil, err
+	}
+	var b bytes.Buffer
+	err = bencode.Marshal(&b, infoData)
+	if err != nil {
+		return nil, err
+	}
+
 	hasher := sha1.New()
-	hasher.Write([]byte(infoStr))
+	hasher.Write(b.Bytes())
 	hash := hasher.Sum(nil)
 	infoHash := [20]byte(hash)
 
 	t := &Torrent{
 		AnnounceUrls: announceUrls,
-		Name:         name,
+		Name:         info.Name,
 		MetaData: MetaData{
 			Length:      length,
 			Files:       files,
-			PieceLength: pieceLength,
+			PieceLength: info.PieceLength,
 			Pieces:      pieces,
 		},
-		InfoHash: infoHash,
-		InfoCh:   make(chan MetaData),
+		InfoHash:         infoHash,
+		MetaDataSignaled: true,
+		MetaDataCond:     *sync.NewCond(&sync.RWMutex{}),
 	}
 	return t, nil
 }
@@ -179,6 +152,7 @@ func ParseMagnet(magnet string) (*Torrent, error) {
 		return nil, errors.New("invalid magnet link: missing xt")
 	}
 	parts := strings.Split(xt, ":")
+
 	if len(parts) != 3 {
 		return nil, fmt.Errorf("invalid magnet link: unsupported extact topic %v", xt)
 	}
@@ -205,12 +179,8 @@ func ParseMagnet(magnet string) (*Torrent, error) {
 	t := &Torrent{
 		AnnounceUrls: trackers,
 		Name:         name,
-		// Length:       length,
-		// Files:        files,
-		// PieceLength:  pieceLength,
-		// Pieces:       pieces,
-		InfoHash: [20]byte(infoHash),
-		InfoCh:   make(chan MetaData),
+		InfoHash:     [20]byte(infoHash),
+		MetaDataCond: *sync.NewCond(&sync.RWMutex{}),
 	}
 	log.Printf("torrent: %v", t)
 	return t, nil
@@ -231,7 +201,7 @@ func (t Torrent) FetchPeers(announceUrl url.URL, clientID [20]byte, port int, ur
 	} else if announceUrl.Scheme == "udp" {
 		go fetchPeersUDP(announceUrl, t, clientID, port, urls, results)
 	} else {
-		log.Printf("unsupported scheme: %s\n", announceUrl.Scheme)
+		log.Printf("unsupported scheme %v: %v\n", announceUrl.Scheme, announceUrl)
 	}
 }
 
@@ -267,24 +237,16 @@ func fetchPeersHTTP(u url.URL, t Torrent, clientID [20]byte, port int, urls chan
 	}
 	defer resp.Body.Close()
 
-	body, err := decodeBecoding(resp.Body)
-	if err != nil {
-		log.Println(err, resp.Body)
+	r := struct {
+		Peers string `bencode:"peers"`
+	}{}
+
+	if err := bencode.Unmarshal(resp.Body, &r); err != nil {
+		log.Println(err)
 		return
 	}
 
-	data, ok := body.(map[string]any)
-	if !ok {
-		log.Printf("expected a dictionary got %T", data)
-		return
-	}
-
-	peersStr, ok := data["peers"].(string)
-	if !ok {
-		log.Printf("missing \"peers\" key in %v", data)
-		return
-	}
-
+	peersStr := r.Peers
 	// assuming ipv4 here
 	if len(peersStr)%6 != 0 {
 		log.Println("invalid peers string: len(peers) must be divisible by 6")

@@ -18,3 +18,6 @@ github.com/anacrolix/utp
 # github.com/huandu/xstrings v1.3.1
 ## explicit; go 1.12
 github.com/huandu/xstrings
+# github.com/jackpal/bencode-go v1.0.2
+## explicit; go 1.21.4
+github.com/jackpal/bencode-go

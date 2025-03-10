@@ -25,10 +25,9 @@ func main() {
 		t, err = torrent.ParseMagnet(*magnet)
 	} else {
 		t, err = torrent.ParseFile(*filePath)
-	}
-
-	if err != nil {
-		log.Fatal(err)
+		if err != nil {
+			log.Fatalf("failed to parse .torrent file %v: %v", *filePath, err)
+		}
 	}
 
 	d := torrent.NewDownloader(t)
