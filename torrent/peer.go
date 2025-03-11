@@ -44,9 +44,8 @@ func (p *Peer) ShakeHands(conn net.Conn, infoHash [20]byte, ID [20]byte) error {
 	return nil
 }
 
-func (p *Peer) HandleBitFieldMessage(msg *Message, pieceCount int) error {
+func (p *Peer) HandleBitFieldMessage(msg *Message) {
 	p.bf = BitField(msg.Payload)
-	return nil
 }
 
 func (p *Peer) IsBitFieldValid(pieceCount int) error {
@@ -75,7 +74,7 @@ func (p Peer) SendInterestedMessage(conn net.Conn) error {
 }
 
 func (p Peer) HasPiece(pieceIndex int) bool {
-	return p.bf.IsSet(pieceIndex)
+	return p.bf == nil || p.bf.IsSet(pieceIndex)
 }
 
 func (p *Peer) SetPiece(pieceIndex int) {
@@ -116,6 +115,8 @@ func (p *Peer) DownloadPiece(conn net.Conn, pieceIndex int, pieceLength int, pie
 		}
 		if msg != nil {
 			switch msg.ID {
+			case MessageBitfield:
+				p.HandleBitFieldMessage(msg)
 			case MessageUnchoke:
 				p.Choked = false
 			case MessageChoke:

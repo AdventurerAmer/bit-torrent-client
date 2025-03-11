@@ -18,7 +18,6 @@ import (
 	"path"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	bencode "github.com/jackpal/bencode-go"
@@ -38,11 +37,9 @@ type MetaData struct {
 
 type Torrent struct {
 	MetaData
-	AnnounceUrls     []string
-	Name             string
-	InfoHash         [20]byte
-	MetaDataSignaled bool
-	MetaDataCond     sync.Cond
+	AnnounceUrls []string
+	Name         string
+	InfoHash     [20]byte
 }
 
 type TorrentFileInfo struct {
@@ -133,9 +130,7 @@ func ParseFile(filepath string) (*Torrent, error) {
 			PieceLength: info.PieceLength,
 			Pieces:      pieces,
 		},
-		InfoHash:         infoHash,
-		MetaDataSignaled: true,
-		MetaDataCond:     *sync.NewCond(&sync.RWMutex{}),
+		InfoHash: infoHash,
 	}
 	return t, nil
 }
@@ -180,7 +175,6 @@ func ParseMagnet(magnet string) (*Torrent, error) {
 		AnnounceUrls: trackers,
 		Name:         name,
 		InfoHash:     [20]byte(infoHash),
-		MetaDataCond: *sync.NewCond(&sync.RWMutex{}),
 	}
 	log.Printf("torrent: %v", t)
 	return t, nil

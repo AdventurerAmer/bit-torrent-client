@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"net"
+	"time"
 )
 
 type MessageID uint8
@@ -95,18 +97,23 @@ func (m *Message) String() string {
 	}
 }
 
-func ReadMessage(r io.Reader) (*Message, error) {
+func ReadMessage(conn net.Conn) (*Message, error) {
 	var length uint32
-	err := binary.Read(r, binary.BigEndian, &length)
+
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	err := binary.Read(conn, binary.BigEndian, &length)
 	if err != nil {
 		return nil, err
 	}
+
 	// keep-alive message
 	if length == 0 {
 		return nil, nil
 	}
 	buf := make([]byte, length)
-	_, err = io.ReadFull(r, buf)
+
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_, err = io.ReadFull(conn, buf)
 	if err != nil {
 		return nil, err
 	}
@@ -114,6 +121,7 @@ func ReadMessage(r io.Reader) (*Message, error) {
 		ID:      MessageID(buf[0]),
 		Payload: buf[1:],
 	}
+	conn.SetReadDeadline(time.Time{})
 	return msg, nil
 }
 
