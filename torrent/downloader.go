@@ -87,7 +87,7 @@ func (d *Downloader) Start(downloadPath string) error {
 		}
 
 		peerSet := make(map[string]bool)
-		peersCh := make(chan Peer, 4096)
+		peersCh := make(chan string, 4096)
 		retryPeerCh := make(chan string, 4096)
 
 		for _, trackerURL := range trackerURLs {
@@ -103,12 +103,11 @@ func (d *Downloader) Start(downloadPath string) error {
 				for _, trackerURL := range trackerURLs {
 					go fetchPeers(d, trackerURL, peersCh)
 				}
-			case p := <-peersCh:
-				key := p.GetAddr()
-				ok := peerSet[key]
+			case addr := <-peersCh:
+				ok := peerSet[addr]
 				if !ok {
-					peerSet[key] = true
-					go handlePeer(d, d.ClientID, p, requests, responses, retryPeerCh)
+					peerSet[addr] = true
+					go handlePeer(d, addr, requests, responses, retryPeerCh)
 				}
 			case r := <-retryPeerCh:
 				delete(peerSet, r)
@@ -337,14 +336,15 @@ func generateClientID() [20]byte {
 	return clientID
 }
 
-func handlePeer(d *Downloader, clientID [20]byte, peer Peer, requestsCh chan pieceRequest, responsesCh chan<- pieceResponce, retryCh chan<- string) {
+func handlePeer(d *Downloader, addr string, requestsCh chan pieceRequest, responsesCh chan<- pieceResponce, retryCh chan<- string) {
 	defer func() {
-		retryCh <- peer.GetAddr()
+		retryCh <- addr
 	}()
 
+	peer := newPeer(addr)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	conn, err := utp.DialContext(ctx, peer.GetAddr())
+	conn, err := utp.DialContext(ctx, peer.Addr)
 
 	if err != nil {
 		log.Printf("failed to connect to peer %s: %s\n", peer, err)
@@ -355,7 +355,7 @@ func handlePeer(d *Downloader, clientID [20]byte, peer Peer, requestsCh chan pie
 		log.Printf("peer %s disconnected", peer)
 	}()
 
-	err = peer.shakeHands(conn, d.Config.FetchPeersTimeout, d.Torrent.InfoHash, clientID)
+	err = peer.ShakeHands(conn, d.Config.FetchPeersTimeout, d.Torrent.InfoHash, d.ClientID)
 	if err != nil {
 		log.Printf("ecountered an error with peer %s: %s\n", peer, err)
 		return
@@ -400,7 +400,7 @@ loop0:
 		}
 		switch msg.ID {
 		case MessageBitfield:
-			peer.handleBitFieldMessage(msg)
+			peer.HandleBitFieldMessage(msg)
 		case MessageExtended:
 			extended := convertMessageToExtended(msg)
 			if extended.Extension != 0 {
@@ -483,7 +483,7 @@ loop0:
 			}
 			switch msg.ID {
 			case MessageBitfield:
-				peer.handleBitFieldMessage(msg)
+				peer.HandleBitFieldMessage(msg)
 				should_advance = false
 			case MessageExtended:
 				extended := convertMessageToExtended(msg)
@@ -531,12 +531,12 @@ loop0:
 
 	log.Println(peer, "Ready to download")
 
-	err = peer.sendUnchokeMessage(conn)
+	err = peer.SendUnchokeMessage(conn)
 	if err != nil {
 		log.Printf("ecountered an error with peer %s: %s\n", peer, err)
 		return
 	}
-	err = peer.sendInterestedMessage(conn)
+	err = peer.SendInterestedMessage(conn)
 	if err != nil {
 		log.Printf("ecountered an error with peer %s: %s\n", peer, err)
 		return
@@ -549,12 +549,12 @@ loop0:
 			break
 		}
 
-		if !peer.hasPiece(request.Index) {
+		if !peer.HasPiece(request.Index) {
 			requestsCh <- request
 			continue
 		}
 
-		data, err := peer.downloadPiece(conn, d, request.Index, request.Length, request.Hash)
+		data, err := peer.DownloadPiece(conn, d.Config.ReadMessageTimeout, request.Index, request.Length, request.Hash)
 		if err != nil {
 			requestsCh <- request
 			continue

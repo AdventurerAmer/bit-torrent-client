@@ -19,7 +19,7 @@ func isTrackerURLSupported(url url.URL) bool {
 	return url.Scheme == "http" || url.Scheme == "https" || url.Scheme == "udp"
 }
 
-func fetchPeers(d *Downloader, url url.URL, peers chan<- Peer) {
+func fetchPeers(d *Downloader, url url.URL, peers chan<- string) {
 	if url.Scheme == "http" || url.Scheme == "https" {
 		fetchPeersHTTP(d, url, peers)
 	} else if url.Scheme == "udp" {
@@ -27,7 +27,7 @@ func fetchPeers(d *Downloader, url url.URL, peers chan<- Peer) {
 	}
 }
 
-func fetchPeersHTTP(d *Downloader, trackerURL url.URL, peers chan<- Peer) {
+func fetchPeersHTTP(d *Downloader, trackerURL url.URL, peers chan<- string) {
 	params := url.Values{
 		"info_hash":  []string{string(d.Torrent.InfoHash[:])},
 		"peer_id":    []string{string(d.ClientID[:])},
@@ -67,15 +67,16 @@ func fetchPeersHTTP(d *Downloader, trackerURL url.URL, peers chan<- Peer) {
 	peerCount := len(peersStr) / 6
 	for i := 0; i < peerCount; i++ {
 		peerData := []byte(peersStr[i*6:])
-		peers <- Peer{
-			IP:   net.IP(peerData[:4]),
-			Port: binary.BigEndian.Uint16(peerData[4:]),
-		}
+
+		ip := net.IP(peerData[:4])
+		port := binary.BigEndian.Uint16(peerData[4:])
+		addr := net.JoinHostPort(ip.String(), strconv.Itoa(int(port)))
+		peers <- addr
 	}
 }
 
 // https://www.bittorrent.org/beps/bep_0015.html
-func fetchPeersUDP(d *Downloader, trackerURL url.URL, peers chan<- Peer) {
+func fetchPeersUDP(d *Downloader, trackerURL url.URL, peers chan<- string) {
 	connStr := net.JoinHostPort(trackerURL.Hostname(), trackerURL.Port())
 	conn, err := net.DialTimeout("udp", connStr, d.Config.FetchPeersTimeout)
 	if err != nil {
@@ -183,11 +184,8 @@ func fetchPeersUDP(d *Downloader, trackerURL url.URL, peers chan<- Peer) {
 		for i := 0; i < int(seeders); i++ {
 			ip := data[i*6 : i*6+4]
 			port := binary.BigEndian.Uint16(data[i*6+4 : i*6+6])
-			peer := Peer{
-				IP:   net.IPv4(ip[0], ip[1], ip[2], ip[3]),
-				Port: port,
-			}
-			peers <- peer
+			addr := net.JoinHostPort(net.IPv4(ip[0], ip[1], ip[2], ip[3]).String(), strconv.Itoa(int(port)))
+			peers <- addr
 		}
 	}
 }

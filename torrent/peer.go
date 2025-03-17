@@ -3,38 +3,46 @@ package torrent
 import (
 	"bytes"
 	"crypto/sha1"
+	"encoding/base32"
 	"encoding/hex"
 	"fmt"
 	"log"
 	"net"
-	"strconv"
 	"time"
 )
 
 type Peer struct {
-	IP     net.IP
-	Port   uint16
+	Addr   string
 	ID     [20]byte
 	bf     BitField
 	Choked bool
 }
 
-func (p Peer) GetAddr() string {
-	return net.JoinHostPort(p.IP.String(), strconv.Itoa(int(p.Port)))
+func newPeer(addr string) Peer {
+	return Peer{
+		Addr: addr,
+	}
 }
 
 func (p Peer) String() string {
-	return p.GetAddr()
+	id := base32.StdEncoding.EncodeToString(p.ID[:])
+	return fmt.Sprintf("%s-%s", id, p.Addr)
 }
 
-func (p *Peer) shakeHands(conn net.Conn, timeout time.Duration, infoHash [20]byte, ID [20]byte) error {
-	handShake := newHandshake(infoHash, ID)
-	handShakeMsg := handShake.Serialize()
-	_, err := conn.Write(handShakeMsg)
-	if err != nil {
-		return err
+func (p *Peer) ShakeHands(conn net.Conn, readTimeout time.Duration, infoHash [20]byte, ID [20]byte) error {
+	handShakeMsg := newHandshake(infoHash, ID).Serialize()
+	for {
+		_, err := conn.Write(handShakeMsg)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			return err
+		} else {
+			break
+		}
 	}
-	peerHandShake, err := readHandshake(conn, timeout)
+	peerHandShake, err := readHandshake(conn, readTimeout)
 	if err != nil {
 		return err
 	}
@@ -45,11 +53,11 @@ func (p *Peer) shakeHands(conn net.Conn, timeout time.Duration, infoHash [20]byt
 	return nil
 }
 
-func (p *Peer) handleBitFieldMessage(msg *Message) {
+func (p *Peer) HandleBitFieldMessage(msg *Message) {
 	p.bf = BitField(msg.Payload)
 }
 
-func (p *Peer) isBitFieldValid(pieceCount int) error {
+func (p *Peer) IsBitFieldValid(pieceCount int) error {
 	payloadLength := pieceCount
 	remainder := pieceCount % 8
 	if remainder != 0 {
@@ -62,30 +70,50 @@ func (p *Peer) isBitFieldValid(pieceCount int) error {
 	return nil
 }
 
-func (p Peer) sendUnchokeMessage(conn net.Conn) error {
+func (p Peer) SendUnchokeMessage(conn net.Conn) error {
 	unchokeMsg := &Message{ID: MessageUnchoke}
-	_, err := conn.Write(unchokeMsg.Serialize())
-	return err
+	for {
+		_, err := conn.Write(unchokeMsg.Serialize())
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			return err
+		} else {
+			break
+		}
+	}
+	return nil
 }
 
-func (p Peer) sendInterestedMessage(conn net.Conn) error {
+func (p Peer) SendInterestedMessage(conn net.Conn) error {
 	interestedMsg := &Message{ID: MessageInterested}
-	_, err := conn.Write(interestedMsg.Serialize())
-	return err
+	for {
+		_, err := conn.Write(interestedMsg.Serialize())
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			return err
+		} else {
+			break
+		}
+	}
+	return nil
 }
 
-func (p Peer) hasPiece(pieceIndex int) bool {
+func (p Peer) HasPiece(pieceIndex int) bool {
 	return p.bf == nil || p.bf.IsSet(pieceIndex)
 }
 
-func (p *Peer) setPiece(pieceIndex int) {
+func (p *Peer) SetPiece(pieceIndex int) {
 	p.bf.Set(pieceIndex)
 }
 
-const MaxBlockSize = 16384
-const MaxBacklog = 5
+func (p *Peer) DownloadPiece(conn net.Conn, readTimeout time.Duration, pieceIndex int, pieceLength int, pieceHash [20]byte) ([]byte, error) {
+	const MaxBlockSize = 16384
+	const MaxBacklog = 5
 
-func (p *Peer) downloadPiece(conn net.Conn, d *Downloader, pieceIndex int, pieceLength int, pieceHash [20]byte) ([]byte, error) {
 	pieceData := make([]byte, pieceLength)
 	downloaded := 0
 	blockOffset := 0
@@ -98,35 +126,27 @@ func (p *Peer) downloadPiece(conn net.Conn, d *Downloader, pieceIndex int, piece
 				if pieceLength-blockOffset < blockSize {
 					blockSize = pieceLength - blockOffset
 				}
-				requestMsg := composeRequestMessage(pieceIndex, blockOffset, blockSize)
-				_, err := conn.Write(requestMsg.Serialize())
-				if err != nil {
-					return nil, err
+				for {
+					_, err := conn.Write(composeRequestMessage(pieceIndex, blockOffset, blockSize).Serialize())
+					if err != nil {
+						if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+							continue
+						}
+						return nil, err
+					} else {
+						break
+					}
 				}
 				blockOffset += blockSize
 				backlog++
 			}
 		}
-		msg, err := readMessage(conn, d.Config.ReadMessageTimeout)
+		msg, err := readMessage(conn, readTimeout)
 		if err != nil {
 			return nil, err
 		}
 		if msg != nil {
-			switch msg.ID {
-			case MessageBitfield:
-				p.handleBitFieldMessage(msg)
-			case MessageUnchoke:
-				p.Choked = false
-			case MessageChoke:
-				p.Choked = true
-			case MessageHave:
-				haveMsg, err := parseHaveMessage(msg)
-				if err != nil {
-					log.Println(err)
-				} else {
-					p.setPiece(haveMsg.PieceIndex)
-				}
-			case MessagePiece:
+			if msg.ID == MessagePiece {
 				pieceMsg, err := parsePieceMessage(msg, pieceIndex, pieceLength)
 				if err != nil {
 					log.Println(err)
@@ -134,6 +154,11 @@ func (p *Peer) downloadPiece(conn net.Conn, d *Downloader, pieceIndex int, piece
 					copy(pieceData[pieceMsg.BlockOffset:], pieceMsg.BlockData)
 					downloaded += len(pieceMsg.BlockData)
 					backlog--
+				}
+			} else {
+				err := p.HandleMessage(msg)
+				if err != nil {
+					log.Println(err)
 				}
 			}
 		}
@@ -143,4 +168,23 @@ func (p *Peer) downloadPiece(conn net.Conn, d *Downloader, pieceIndex int, piece
 		return nil, fmt.Errorf("piece %d failed integrity check got hash %s should be %s", pieceIndex, hex.EncodeToString(hash[:]), hex.EncodeToString(pieceHash[:]))
 	}
 	return pieceData, nil
+}
+
+func (p *Peer) HandleMessage(msg *Message) error {
+	switch msg.ID {
+	case MessageBitfield:
+		p.HandleBitFieldMessage(msg)
+	case MessageUnchoke:
+		p.Choked = false
+	case MessageChoke:
+		p.Choked = true
+	case MessageHave:
+		haveMsg, err := parseHaveMessage(msg)
+		if err != nil {
+			return err
+		} else {
+			p.SetPiece(haveMsg.PieceIndex)
+		}
+	}
+	return nil
 }
