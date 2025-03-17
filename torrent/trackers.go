@@ -198,24 +198,30 @@ func handleUTPRequest(conn net.Conn, request []byte) ([]byte, error) {
 	for {
 		_, err := conn.Write(request)
 		if err != nil {
-			if netErr, ok := err.(net.Error); ok && !netErr.Timeout() {
-				return nil, err
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
 			}
-			continue
+			return nil, err
 		}
 		timeout := 15 * int(math.Floor(math.Pow(2.0, float64(retransmissionExponent))))
-		conn.SetReadDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
-		n, err := conn.Read(res)
-		conn.SetReadDeadline(time.Time{})
+		err = conn.SetReadDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
 		if err != nil {
-			if netErr, ok := err.(net.Error); ok && !netErr.Timeout() {
-				return nil, err
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
 			}
-		} else {
-			return res[:n], nil
+			return nil, err
 		}
+		n, err := conn.Read(res)
 		if retransmissionExponent < 8 {
 			retransmissionExponent++
+		}
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			return nil, err
+		} else {
+			return res[:n], nil
 		}
 	}
 }

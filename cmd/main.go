@@ -14,6 +14,7 @@ func main() {
 	cfg := torrent.Config{}
 	flag.DurationVar(&cfg.FetchPeersTimeout, "fetch-peers-timeout", 10*time.Second, "fetch peers timeout")
 	flag.DurationVar(&cfg.UpdateTrackersRate, "update-tracker-rate", 1*time.Minute, "update trackers rate")
+	flag.DurationVar(&cfg.ReadMessageTimeout, "read message timeout", 10*time.Second, "read message timeout")
 
 	filePath := flag.String("file", "", "path of torrent file")
 	magnet := flag.String("magnet", "", "magnet link")

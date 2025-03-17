@@ -355,7 +355,7 @@ func handlePeer(d *Downloader, clientID [20]byte, peer Peer, requestsCh chan pie
 		log.Printf("peer %s disconnected", peer)
 	}()
 
-	err = peer.ShakeHands(conn, d.Torrent.InfoHash, clientID)
+	err = peer.shakeHands(conn, d.Config.FetchPeersTimeout, d.Torrent.InfoHash, clientID)
 	if err != nil {
 		log.Printf("ecountered an error with peer %s: %s\n", peer, err)
 		return
@@ -380,7 +380,7 @@ func handlePeer(d *Downloader, clientID [20]byte, peer Peer, requestsCh chan pie
 		log.Println(err)
 		return
 	}
-	extendedHandShake := NewExtendedMessage(0, requestBuf.Bytes())
+	extendedHandShake := newExtendedMessage(0, requestBuf.Bytes())
 	_, err = conn.Write(extendedHandShake.Serialize())
 	if err != nil {
 		log.Println(err)
@@ -390,7 +390,7 @@ func handlePeer(d *Downloader, clientID [20]byte, peer Peer, requestsCh chan pie
 	var metaDataSize int
 loop0:
 	for {
-		msg, err := ReadMessage(conn)
+		msg, err := readMessage(conn, d.Config.ReadMessageTimeout)
 		if err != nil {
 			log.Println(err)
 			return
@@ -400,9 +400,9 @@ loop0:
 		}
 		switch msg.ID {
 		case MessageBitfield:
-			peer.HandleBitFieldMessage(msg)
+			peer.handleBitFieldMessage(msg)
 		case MessageExtended:
-			extended := ConvertMessageToExtended(msg)
+			extended := convertMessageToExtended(msg)
 			if extended.Extension != 0 {
 				log.Printf("ecountered an error with peer %s: extention must be zero\n", peer)
 				return
@@ -463,7 +463,7 @@ loop0:
 				log.Println(err)
 				continue
 			}
-			reqMsg := NewExtendedMessage(byte(utMetadataID), reqPayload.Bytes())
+			reqMsg := newExtendedMessage(byte(utMetadataID), reqPayload.Bytes())
 			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			_, err := conn.Write(reqMsg.Serialize())
 			if err != nil {
@@ -472,7 +472,7 @@ loop0:
 			}
 			conn.SetWriteDeadline(time.Time{})
 
-			msg, err := ReadMessage(conn)
+			msg, err := readMessage(conn, d.Config.ReadMessageTimeout)
 			if err != nil {
 				log.Println(peer, "failed to read", err)
 				return
@@ -483,10 +483,10 @@ loop0:
 			}
 			switch msg.ID {
 			case MessageBitfield:
-				peer.HandleBitFieldMessage(msg)
+				peer.handleBitFieldMessage(msg)
 				should_advance = false
 			case MessageExtended:
-				extended := ConvertMessageToExtended(msg)
+				extended := convertMessageToExtended(msg)
 				if extended.Extension != byte(utMetadataID) {
 					should_advance = false
 					break
@@ -531,12 +531,12 @@ loop0:
 
 	log.Println(peer, "Ready to download")
 
-	err = peer.SendUnchokeMessage(conn)
+	err = peer.sendUnchokeMessage(conn)
 	if err != nil {
 		log.Printf("ecountered an error with peer %s: %s\n", peer, err)
 		return
 	}
-	err = peer.SendInterestedMessage(conn)
+	err = peer.sendInterestedMessage(conn)
 	if err != nil {
 		log.Printf("ecountered an error with peer %s: %s\n", peer, err)
 		return
@@ -549,18 +549,18 @@ loop0:
 			break
 		}
 
-		if !peer.HasPiece(request.Index) {
+		if !peer.hasPiece(request.Index) {
 			requestsCh <- request
 			continue
 		}
 
-		data, err := peer.DownloadPiece(conn, request.Index, request.Length, request.Hash)
+		data, err := peer.downloadPiece(conn, d, request.Index, request.Length, request.Hash)
 		if err != nil {
 			requestsCh <- request
 			continue
 		}
 
-		haveMsg := ComposeHaveMessage(request.Index)
+		haveMsg := composeHaveMessage(request.Index)
 		_, err = conn.Write(haveMsg.Serialize())
 		if err != nil {
 			log.Println(err)

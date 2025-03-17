@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strconv"
 	"time"
 )
 
@@ -18,22 +19,22 @@ type Peer struct {
 	Choked bool
 }
 
-func (p Peer) String() string {
-	return fmt.Sprintf("%s:%d", p.IP, p.Port)
-}
-
 func (p Peer) GetAddr() string {
-	return fmt.Sprintf("%s:%d", p.IP, p.Port)
+	return net.JoinHostPort(p.IP.String(), strconv.Itoa(int(p.Port)))
 }
 
-func (p *Peer) ShakeHands(conn net.Conn, infoHash [20]byte, ID [20]byte) error {
-	handShake := NewHandshake(infoHash, ID)
+func (p Peer) String() string {
+	return p.GetAddr()
+}
+
+func (p *Peer) shakeHands(conn net.Conn, timeout time.Duration, infoHash [20]byte, ID [20]byte) error {
+	handShake := newHandshake(infoHash, ID)
 	handShakeMsg := handShake.Serialize()
 	_, err := conn.Write(handShakeMsg)
 	if err != nil {
 		return err
 	}
-	peerHandShake, err := ReadHandshake(conn)
+	peerHandShake, err := readHandshake(conn, timeout)
 	if err != nil {
 		return err
 	}
@@ -44,11 +45,11 @@ func (p *Peer) ShakeHands(conn net.Conn, infoHash [20]byte, ID [20]byte) error {
 	return nil
 }
 
-func (p *Peer) HandleBitFieldMessage(msg *Message) {
+func (p *Peer) handleBitFieldMessage(msg *Message) {
 	p.bf = BitField(msg.Payload)
 }
 
-func (p *Peer) IsBitFieldValid(pieceCount int) error {
+func (p *Peer) isBitFieldValid(pieceCount int) error {
 	payloadLength := pieceCount
 	remainder := pieceCount % 8
 	if remainder != 0 {
@@ -61,33 +62,30 @@ func (p *Peer) IsBitFieldValid(pieceCount int) error {
 	return nil
 }
 
-func (p Peer) SendUnchokeMessage(conn net.Conn) error {
+func (p Peer) sendUnchokeMessage(conn net.Conn) error {
 	unchokeMsg := &Message{ID: MessageUnchoke}
 	_, err := conn.Write(unchokeMsg.Serialize())
 	return err
 }
 
-func (p Peer) SendInterestedMessage(conn net.Conn) error {
+func (p Peer) sendInterestedMessage(conn net.Conn) error {
 	interestedMsg := &Message{ID: MessageInterested}
 	_, err := conn.Write(interestedMsg.Serialize())
 	return err
 }
 
-func (p Peer) HasPiece(pieceIndex int) bool {
+func (p Peer) hasPiece(pieceIndex int) bool {
 	return p.bf == nil || p.bf.IsSet(pieceIndex)
 }
 
-func (p *Peer) SetPiece(pieceIndex int) {
+func (p *Peer) setPiece(pieceIndex int) {
 	p.bf.Set(pieceIndex)
 }
 
 const MaxBlockSize = 16384
 const MaxBacklog = 5
 
-func (p *Peer) DownloadPiece(conn net.Conn, pieceIndex int, pieceLength int, pieceHash [20]byte) ([]byte, error) {
-	conn.SetDeadline(time.Now().Add(30 * time.Second))
-	defer conn.SetDeadline(time.Time{})
-
+func (p *Peer) downloadPiece(conn net.Conn, d *Downloader, pieceIndex int, pieceLength int, pieceHash [20]byte) ([]byte, error) {
 	pieceData := make([]byte, pieceLength)
 	downloaded := 0
 	blockOffset := 0
@@ -100,7 +98,7 @@ func (p *Peer) DownloadPiece(conn net.Conn, pieceIndex int, pieceLength int, pie
 				if pieceLength-blockOffset < blockSize {
 					blockSize = pieceLength - blockOffset
 				}
-				requestMsg := ComposeRequestMessage(pieceIndex, blockOffset, blockSize)
+				requestMsg := composeRequestMessage(pieceIndex, blockOffset, blockSize)
 				_, err := conn.Write(requestMsg.Serialize())
 				if err != nil {
 					return nil, err
@@ -109,27 +107,27 @@ func (p *Peer) DownloadPiece(conn net.Conn, pieceIndex int, pieceLength int, pie
 				backlog++
 			}
 		}
-		msg, err := ReadMessage(conn)
+		msg, err := readMessage(conn, d.Config.ReadMessageTimeout)
 		if err != nil {
 			return nil, err
 		}
 		if msg != nil {
 			switch msg.ID {
 			case MessageBitfield:
-				p.HandleBitFieldMessage(msg)
+				p.handleBitFieldMessage(msg)
 			case MessageUnchoke:
 				p.Choked = false
 			case MessageChoke:
 				p.Choked = true
 			case MessageHave:
-				haveMsg, err := ParseHaveMessage(msg)
+				haveMsg, err := parseHaveMessage(msg)
 				if err != nil {
 					log.Println(err)
 				} else {
-					p.SetPiece(haveMsg.PieceIndex)
+					p.setPiece(haveMsg.PieceIndex)
 				}
 			case MessagePiece:
-				pieceMsg, err := ParsePieceMessage(msg, pieceIndex, pieceLength)
+				pieceMsg, err := parsePieceMessage(msg, pieceIndex, pieceLength)
 				if err != nil {
 					log.Println(err)
 				} else {

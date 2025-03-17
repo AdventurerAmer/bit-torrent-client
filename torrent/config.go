@@ -5,4 +5,5 @@ import "time"
 type Config struct {
 	FetchPeersTimeout  time.Duration
 	UpdateTrackersRate time.Duration
+	ReadMessageTimeout time.Duration
 }

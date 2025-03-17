@@ -2,7 +2,10 @@ package torrent
 
 import (
 	"bytes"
+	"encoding/binary"
 	"io"
+	"net"
+	"time"
 )
 
 type Handshake struct {
@@ -11,7 +14,7 @@ type Handshake struct {
 	ID       [20]byte
 }
 
-func NewHandshake(infoHash [20]byte, ID [20]byte) *Handshake {
+func newHandshake(infoHash [20]byte, ID [20]byte) *Handshake {
 	return &Handshake{
 		Str:      "BitTorrent protocol",
 		InfoHash: infoHash,
@@ -24,43 +27,84 @@ func (h *Handshake) Serialize() []byte {
 	b.WriteByte(byte(len(h.Str)))
 	b.Write([]byte(h.Str))
 	extensions := make([]byte, 8)
-	extensions[5] = 0x10
+	extensions[5] = 0x10 // extended handshake
 	b.Write(extensions)
 	b.Write(h.InfoHash[:])
 	b.Write(h.ID[:])
 	return b.Bytes()
 }
 
-func ReadHandshake(r io.Reader) (*Handshake, error) {
-	length := make([]byte, 1)
-	_, err := io.ReadFull(r, length)
-	if err != nil {
-		return nil, err
+func readHandshake(conn net.Conn, timeout time.Duration) (*Handshake, error) {
+	length := uint8(0)
+
+	for {
+		err := conn.SetReadDeadline(time.Now().Add(timeout))
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			return nil, err
+		}
+		err = binary.Read(conn, binary.BigEndian, &length)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			return nil, err
+		} else {
+			break
+		}
 	}
-	str := make([]byte, length[0])
-	_, err = io.ReadFull(r, str)
-	if err != nil {
-		return nil, err
+
+	str := make([]byte, length)
+
+	for {
+		err := conn.SetReadDeadline(time.Now().Add(timeout))
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			return nil, err
+		}
+		_, err = io.ReadFull(conn, str)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			return nil, err
+		} else {
+			break
+		}
 	}
-	extensions := make([]byte, 8)
-	_, err = io.ReadFull(r, extensions)
-	if err != nil {
-		return nil, err
+
+	buf := make([]byte, 8+20+20)
+	for {
+		err := conn.SetReadDeadline(time.Now().Add(timeout))
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			return nil, err
+		}
+		_, err = io.ReadFull(conn, buf)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			return nil, err
+		} else {
+			break
+		}
 	}
-	infoHash := make([]byte, 20)
-	_, err = io.ReadFull(r, infoHash)
-	if err != nil {
-		return nil, err
-	}
-	ID := make([]byte, 20)
-	_, err = io.ReadFull(r, ID)
-	if err != nil {
-		return nil, err
-	}
+
+	extensions := buf[:8]
+	_ = extensions
+	infoHash := buf[8:28]
+	id := buf[28:]
 	h := &Handshake{
 		Str:      string(str),
 		InfoHash: [20]byte(infoHash),
-		ID:       [20]byte(ID),
+		ID:       [20]byte(id),
 	}
 	return h, nil
 }

@@ -29,33 +29,6 @@ type Message struct {
 	Payload []byte
 }
 
-type ExtendedMessage struct {
-	ID        MessageID
-	Extension byte
-	Payload   []byte
-}
-
-func NewExtendedMessage(extensionID byte, payload []byte) *ExtendedMessage {
-	return &ExtendedMessage{
-		ID:        MessageExtended,
-		Extension: extensionID,
-		Payload:   payload,
-	}
-}
-
-func (e *ExtendedMessage) Serialize() []byte {
-	if e == nil {
-		return make([]byte, 4)
-	}
-	var b bytes.Buffer
-	length := uint32(2 + len(e.Payload))
-	binary.Write(&b, binary.BigEndian, length)
-	b.WriteByte(byte(e.ID))
-	b.WriteByte(byte(e.Extension))
-	b.Write(e.Payload)
-	return b.Bytes()
-}
-
 func (m *Message) Serialize() []byte {
 	if m == nil {
 		return make([]byte, 4)
@@ -97,50 +70,67 @@ func (m *Message) String() string {
 	}
 }
 
-func ReadMessage(conn net.Conn) (*Message, error) {
+func readMessage(conn net.Conn, timeout time.Duration) (*Message, error) {
 	var length uint32
-
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	err := binary.Read(conn, binary.BigEndian, &length)
-	if err != nil {
-		return nil, err
+	for {
+		err := conn.SetReadDeadline(time.Now().Add(timeout))
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			return nil, err
+		}
+		err = binary.Read(conn, binary.BigEndian, &length)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			return nil, err
+		} else {
+			break
+		}
 	}
 
 	// keep-alive message
 	if length == 0 {
 		return nil, nil
 	}
+
 	buf := make([]byte, length)
 
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	_, err = io.ReadFull(conn, buf)
-	if err != nil {
-		return nil, err
+	for {
+		err := conn.SetReadDeadline(time.Now().Add(timeout))
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			return nil, err
+		}
+		_, err = io.ReadFull(conn, buf)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			return nil, err
+		} else {
+			break
+		}
 	}
 	msg := &Message{
 		ID:      MessageID(buf[0]),
 		Payload: buf[1:],
 	}
-	conn.SetReadDeadline(time.Time{})
 	return msg, nil
 }
 
-func ConvertMessageToExtended(msg *Message) *ExtendedMessage {
-	return &ExtendedMessage{
-		ID:        msg.ID,
-		Extension: msg.Payload[0],
-		Payload:   msg.Payload[1:],
-	}
-}
-
-func ComposeRequestMessage(pieceIndex, offset, blockSize int) *Message {
-	payload := make([]byte, 12)
-	binary.BigEndian.PutUint32(payload[:4], uint32(pieceIndex))
-	binary.BigEndian.PutUint32(payload[4:8], uint32(offset))
-	binary.BigEndian.PutUint32(payload[8:12], uint32(blockSize))
+func composeRequestMessage(pieceIndex, offset, blockSize int) *Message {
+	var b bytes.Buffer
+	binary.Write(&b, binary.BigEndian, uint32(pieceIndex))
+	binary.Write(&b, binary.BigEndian, uint32(offset))
+	binary.Write(&b, binary.BigEndian, uint32(blockSize))
 	return &Message{
 		ID:      MessageRequest,
-		Payload: payload,
+		Payload: b.Bytes(),
 	}
 }
 
@@ -148,7 +138,7 @@ type HaveMessage struct {
 	PieceIndex int
 }
 
-func ComposeHaveMessage(pieceIndex int) *Message {
+func composeHaveMessage(pieceIndex int) *Message {
 	payload := make([]byte, 4)
 	binary.BigEndian.PutUint32(payload, uint32(pieceIndex))
 	haveMsg := &Message{
@@ -158,7 +148,7 @@ func ComposeHaveMessage(pieceIndex int) *Message {
 	return haveMsg
 }
 
-func ParseHaveMessage(msg *Message) (*HaveMessage, error) {
+func parseHaveMessage(msg *Message) (*HaveMessage, error) {
 	if len(msg.Payload) != 4 {
 		return nil, fmt.Errorf("malformed msg %s payload must be 4 bytes", msg)
 	}
@@ -175,7 +165,7 @@ type PieceMessage struct {
 	BlockData   []byte
 }
 
-func ParsePieceMessage(msg *Message, pieceIndex int, pieceLength int) (*PieceMessage, error) {
+func parsePieceMessage(msg *Message, pieceIndex int, pieceLength int) (*PieceMessage, error) {
 	if len(msg.Payload) < 8 {
 		return nil, fmt.Errorf("malformed msg %s payload must be atleast 8 bytes", msg)
 	}
@@ -197,4 +187,39 @@ func ParsePieceMessage(msg *Message, pieceIndex int, pieceLength int) (*PieceMes
 		BlockData:   data,
 	}
 	return pieceMsg, nil
+}
+
+type ExtendedMessage struct {
+	ID        MessageID
+	Extension byte
+	Payload   []byte
+}
+
+func newExtendedMessage(extensionID byte, payload []byte) *ExtendedMessage {
+	return &ExtendedMessage{
+		ID:        MessageExtended,
+		Extension: extensionID,
+		Payload:   payload,
+	}
+}
+
+func (e *ExtendedMessage) Serialize() []byte {
+	if e == nil {
+		return make([]byte, 4)
+	}
+	var b bytes.Buffer
+	length := uint32(2 + len(e.Payload))
+	binary.Write(&b, binary.BigEndian, length)
+	b.WriteByte(byte(e.ID))
+	b.WriteByte(byte(e.Extension))
+	b.Write(e.Payload)
+	return b.Bytes()
+}
+
+func convertMessageToExtended(msg *Message) *ExtendedMessage {
+	return &ExtendedMessage{
+		ID:        msg.ID,
+		Extension: msg.Payload[0],
+		Payload:   msg.Payload[1:],
+	}
 }
