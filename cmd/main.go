@@ -3,13 +3,17 @@ package main
 import (
 	"flag"
 	"log"
+	"time"
 
 	"github.com/AdventurerAmer/bit-torrent-client/torrent"
 )
 
 func main() {
-
 	log.SetFlags(log.LUTC | log.Llongfile)
+
+	cfg := torrent.Config{}
+	flag.DurationVar(&cfg.FetchPeersTimeout, "fetch-peers-timeout", 10*time.Second, "fetch peers timeout")
+	flag.DurationVar(&cfg.UpdateTrackersRate, "update-tracker-rate", 1*time.Minute, "update trackers rate")
 
 	filePath := flag.String("file", "", "path of torrent file")
 	magnet := flag.String("magnet", "", "magnet link")
@@ -25,13 +29,14 @@ func main() {
 		t, err = torrent.ParseMagnet(*magnet)
 	} else {
 		t, err = torrent.ParseFile(*filePath)
-		if err != nil {
-			log.Fatalf("failed to parse .torrent file %v: %v", *filePath, err)
-		}
 	}
 
-	d := torrent.NewDownloader(t)
-	err = d.Download(*downloadPath)
+	if err != nil {
+		log.Fatalf("failed to parse torrent %v: %v", *filePath, err)
+	}
+
+	d := torrent.NewDownloader(cfg, t)
+	err = d.Start(*downloadPath)
 	if err != nil {
 		log.Fatal(err)
 	}

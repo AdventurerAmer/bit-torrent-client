@@ -26,11 +26,12 @@ type MetaDataPiece struct {
 }
 
 type Downloader struct {
-	Torrent                    *Torrent
-	Done                       chan struct{}
-	Progress                   chan float64
-	Files                      []*os.File
-	Ranges                     map[int][]fileRange
+	Config  Config
+	Torrent *Torrent
+
+	ClientID [20]byte
+	Port     int
+
 	MetaDataPieceResCh         chan MetaDataPiece
 	MetaDataPieceResFinishedCh chan struct{}
 	MetaDataSize               int
@@ -38,58 +39,76 @@ type Downloader struct {
 	MetaDataPieceCount         int
 	MetaDataSignaled           bool
 	MetaDataCond               *sync.Cond
+
+	Files  []*os.File
+	Ranges map[int][]fileRange
+
+	Done     chan struct{}
+	Progress chan float64
 }
 
-func NewDownloader(torrent *Torrent) *Downloader {
+func NewDownloader(config Config, torrent *Torrent) *Downloader {
 	return &Downloader{
+		Config:                     config,
 		Torrent:                    torrent,
-		Done:                       make(chan struct{}),
-		Ranges:                     make(map[int][]fileRange),
+		ClientID:                   generateClientID(),
+		Port:                       6881,
 		MetaDataSignaled:           torrent.Length != 0,
 		MetaDataCond:               sync.NewCond(&sync.Mutex{}),
 		MetaDataPieceResFinishedCh: make(chan struct{}),
+		Done:                       make(chan struct{}),
+		Ranges:                     make(map[int][]fileRange),
 	}
 }
 
-func (d *Downloader) Download(downloadPath string) error {
+func (d *Downloader) Start(downloadPath string) error {
 	fmt.Println("InfoHash:", hex.EncodeToString(d.Torrent.InfoHash[:]))
 	fmt.Printf("Length: %d bytes\n", d.Torrent.Length)
-
-	clientID, err := generateClientID()
-	if err != nil {
-		return err
-	}
-	fmt.Printf("Starting downloader with id: %s\n", hex.EncodeToString(clientID[:]))
+	fmt.Printf("Starting downloader with id: %s\n", hex.EncodeToString(d.ClientID[:]))
 
 	var (
 		requests  = make(chan pieceRequest, 4096)
 		responses = make(chan pieceResponce, 4096)
 	)
 	go func() {
-		peerSet := make(map[string]bool)
-		peersCh := make(chan Peer, 4096)
-		urlsCh := make(chan url.URL, len(d.Torrent.AnnounceUrls))
-		retryPeerCh := make(chan string, 4096)
-		for _, u := range d.Torrent.AnnounceUrls {
-			base, err := url.Parse(u)
+		trackerURLs := make([]url.URL, 0, len(d.Torrent.AnnounceUrls))
+
+		for _, trackerURL := range d.Torrent.AnnounceUrls {
+			u, err := url.Parse(trackerURL)
 			if err != nil {
-				log.Println(err)
+				log.Printf("failed to parse tracker url '%v': %v\n", trackerURL, err)
 				continue
 			}
-			urlsCh <- *base
+			if !isTrackerURLSupported(*u) {
+				log.Printf("unsupported tracker url '%v'", trackerURL)
+				continue
+			}
+			trackerURLs = append(trackerURLs, *u)
 		}
-		port := 6881 // clients will try to listen on ports 6881 to 6889 before giving up.
+
+		peerSet := make(map[string]bool)
+		peersCh := make(chan Peer, 4096)
+		retryPeerCh := make(chan string, 4096)
+
+		for _, trackerURL := range trackerURLs {
+			go fetchPeers(d, trackerURL, peersCh)
+		}
+
+		trackerTicker := time.NewTicker(d.Config.UpdateTrackersRate)
+
 	loop:
 		for {
 			select {
-			case u := <-urlsCh:
-				d.Torrent.FetchPeers(u, clientID, port, urlsCh, peersCh)
+			case <-trackerTicker.C:
+				for _, trackerURL := range trackerURLs {
+					go fetchPeers(d, trackerURL, peersCh)
+				}
 			case p := <-peersCh:
 				key := p.GetAddr()
 				ok := peerSet[key]
 				if !ok {
 					peerSet[key] = true
-					go handlePeer(d, clientID, p, requests, responses, retryPeerCh)
+					go handlePeer(d, d.ClientID, p, requests, responses, retryPeerCh)
 				}
 			case r := <-retryPeerCh:
 				delete(peerSet, r)
@@ -312,16 +331,10 @@ type pieceResponce struct {
 	Data  []byte
 }
 
-func generateClientID() ([20]byte, error) {
+func generateClientID() [20]byte {
 	clientID := [20]byte{}
-	n, err := rand.Read(clientID[:])
-	if err != nil {
-		return [20]byte{}, err
-	}
-	if n != len(clientID) {
-		return [20]byte{}, fmt.Errorf("failed to generate full ID: generated %d bytes but need %d", n, len(clientID))
-	}
-	return clientID, nil
+	_, _ = rand.Read(clientID[:])
+	return clientID
 }
 
 func handlePeer(d *Downloader, clientID [20]byte, peer Peer, requestsCh chan pieceRequest, responsesCh chan<- pieceResponce, retryCh chan<- string) {
