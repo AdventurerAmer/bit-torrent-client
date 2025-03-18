@@ -3,22 +3,38 @@ package torrent
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/sha1"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/url"
 	"os"
 	"path"
-	"sync"
 	"time"
 
 	"github.com/anacrolix/utp"
 	"github.com/jackpal/bencode-go"
 )
+
+type fileRange struct {
+	file  *os.File
+	start int
+	end   int
+}
+
+type pieceRequest struct {
+	Index  int
+	Hash   [20]byte
+	Length int
+}
+
+type pieceResponce struct {
+	Index int
+	Data  []byte
+}
 
 type MetaDataPiece struct {
 	Index int
@@ -32,33 +48,54 @@ type Downloader struct {
 	ClientID [20]byte
 	Port     int
 
-	MetaDataPieceResCh         chan MetaDataPiece
-	MetaDataPieceResFinishedCh chan struct{}
-	MetaDataSize               int
-	MetaDataPieceSize          int
-	MetaDataPieceCount         int
-	MetaDataSignaled           bool
-	MetaDataCond               *sync.Cond
+	MetaDataSize       int
+	MetaDataPieceSize  int
+	MetaDataPieceCount int
+
+	MetaDataSizeCh     chan int
+	MetaDataSizeDoneCh chan struct{}
+
+	MetaDataPieceCh      chan MetaDataPiece
+	MetaDataPiecesDoneCh chan struct{}
 
 	Files  []*os.File
 	Ranges map[int][]fileRange
 
+	PieceRequestsCh chan pieceRequest
+	PieceResponseCh chan pieceResponce
+
+	InFlightPeers map[string]bool
+	FetchPeerCh   chan string
+	RetryPeerCh   chan string
+
+	Closed   chan struct{}
 	Done     chan struct{}
 	Progress chan float64
 }
 
 func NewDownloader(config Config, torrent *Torrent) *Downloader {
-	return &Downloader{
-		Config:                     config,
-		Torrent:                    torrent,
-		ClientID:                   generateClientID(),
-		Port:                       6881,
-		MetaDataSignaled:           torrent.Length != 0,
-		MetaDataCond:               sync.NewCond(&sync.Mutex{}),
-		MetaDataPieceResFinishedCh: make(chan struct{}),
-		Done:                       make(chan struct{}),
-		Ranges:                     make(map[int][]fileRange),
+	d := &Downloader{
+		Config:               config,
+		Torrent:              torrent,
+		ClientID:             generateClientID(),
+		Port:                 6881,
+		MetaDataSizeDoneCh:   make(chan struct{}),
+		MetaDataPiecesDoneCh: make(chan struct{}),
+		InFlightPeers:        make(map[string]bool),
+		FetchPeerCh:          make(chan string, 8192),
+		RetryPeerCh:          make(chan string, 8192),
+		Closed:               make(chan struct{}),
+		Done:                 make(chan struct{}),
+		Ranges:               make(map[int][]fileRange),
 	}
+	if torrent.Length == 0 {
+		d.MetaDataSizeCh = make(chan int)
+		d.MetaDataPieceCh = make(chan MetaDataPiece)
+	} else {
+		close(d.MetaDataSizeDoneCh)
+		close(d.MetaDataPiecesDoneCh)
+	}
+	return d
 }
 
 func (d *Downloader) Start(downloadPath string) error {
@@ -66,10 +103,6 @@ func (d *Downloader) Start(downloadPath string) error {
 	fmt.Printf("Length: %d bytes\n", d.Torrent.Length)
 	fmt.Printf("Starting downloader with id: %s\n", hex.EncodeToString(d.ClientID[:]))
 
-	var (
-		requests  = make(chan pieceRequest, 4096)
-		responses = make(chan pieceResponce, 4096)
-	)
 	go func() {
 		trackerURLs := make([]url.URL, 0, len(d.Torrent.AnnounceUrls))
 
@@ -86,49 +119,54 @@ func (d *Downloader) Start(downloadPath string) error {
 			trackerURLs = append(trackerURLs, *u)
 		}
 
-		peerSet := make(map[string]bool)
-		peersCh := make(chan string, 4096)
-		retryPeerCh := make(chan string, 4096)
-
 		for _, trackerURL := range trackerURLs {
-			go fetchPeers(d, trackerURL, peersCh)
+			go fetchPeers(d, trackerURL)
 		}
 
 		trackerTicker := time.NewTicker(d.Config.UpdateTrackersRate)
+		retryPeersTicker := time.NewTicker(d.Config.RetryPeersRate)
 
 	loop:
 		for {
 			select {
 			case <-trackerTicker.C:
 				for _, trackerURL := range trackerURLs {
-					go fetchPeers(d, trackerURL, peersCh)
+					go fetchPeers(d, trackerURL)
 				}
-			case addr := <-peersCh:
-				ok := peerSet[addr]
-				if !ok {
-					peerSet[addr] = true
-					go handlePeer(d, addr, requests, responses, retryPeerCh)
+			case addr := <-d.FetchPeerCh:
+				inflight := d.InFlightPeers[addr]
+				if !inflight {
+					d.InFlightPeers[addr] = true
+					go handlePeer(d, addr)
 				}
-			case r := <-retryPeerCh:
-				delete(peerSet, r)
+			case addr := <-d.RetryPeerCh:
+				d.InFlightPeers[addr] = false
+			case <-retryPeersTicker.C:
+				for addr, inflight := range d.InFlightPeers {
+					if !inflight {
+						d.InFlightPeers[addr] = true
+						go handlePeer(d, addr)
+					}
+				}
 			case <-d.Done:
 				break loop
 			}
 		}
 	}()
 
-	func() {
-		d.MetaDataCond.L.Lock()
-		defer d.MetaDataCond.L.Unlock()
-		for !d.MetaDataSignaled {
-			d.MetaDataCond.Wait()
-		}
-	}()
+	if d.MetaDataSizeCh != nil {
+		const PieceSize = 16384
 
-	if d.MetaDataPieceResCh != nil {
+		metaDataSize := <-d.MetaDataSizeCh
+		close(d.MetaDataSizeDoneCh)
+
+		d.MetaDataSize = metaDataSize
+		d.MetaDataPieceCount = (metaDataSize + PieceSize - 1) / PieceSize
+		d.MetaDataPieceSize = PieceSize
+
 		metaDataPieces := make([][]byte, d.MetaDataPieceCount)
 		metaDataPieceCount := 0
-		for res := range d.MetaDataPieceResCh {
+		for res := range d.MetaDataPieceCh {
 			if metaDataPieces[res.Index] == nil {
 				log.Printf("Downloader Got Meta Piece #%v out of %v\n", res.Index, d.MetaDataPieceCount)
 				metaDataPieces[res.Index] = res.Data
@@ -139,23 +177,18 @@ func (d *Downloader) Start(downloadPath string) error {
 			}
 		}
 
-		close(d.MetaDataPieceResFinishedCh)
-
 		metaDataBuf := make([]byte, d.MetaDataSize)
 		for i := 0; i < len(metaDataPieces); i++ {
 			copy(metaDataBuf[i*d.MetaDataPieceSize:], metaDataPieces[i])
 		}
 
-		hasher := sha1.New()
-		hasher.Write(metaDataBuf)
-		infoHash := hasher.Sum(nil)
-		if !bytes.Equal(infoHash, d.Torrent.InfoHash[:]) {
+		infoHash := sha1.Sum(metaDataBuf)
+		if !bytes.Equal(infoHash[:], d.Torrent.InfoHash[:]) {
 			return errors.New("invalid magnent link")
 		}
 
 		info := TorrentInfo{}
 		if err := bencode.Unmarshal(bytes.NewReader(metaDataBuf), &info); err != nil {
-			log.Println("unmarshal", err)
 			return err
 		}
 
@@ -192,7 +225,7 @@ func (d *Downloader) Start(downloadPath string) error {
 		d.Torrent.Name = info.Name
 	}
 
-	log.Println("Got Info...")
+	log.Println("Got Meta Data Info")
 
 	for _, info := range d.Torrent.Files {
 		filePath := path.Join(downloadPath, info.Path)
@@ -227,7 +260,7 @@ func (d *Downloader) Start(downloadPath string) error {
 	for _, file := range d.Files {
 		stat, err := file.Stat()
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 		fileSize := int(stat.Size())
 		fileOffset := 0
@@ -247,6 +280,8 @@ func (d *Downloader) Start(downloadPath string) error {
 	}
 
 	downloadedPieces := 0
+	d.PieceRequestsCh = make(chan pieceRequest, len(d.Torrent.Pieces))
+	d.PieceResponseCh = make(chan pieceResponce, len(d.Torrent.Pieces))
 
 	for i := 0; i < len(d.Torrent.Pieces); i++ {
 		pieceLength := d.Torrent.CalculatePieceLength(i)
@@ -258,7 +293,7 @@ func (d *Downloader) Start(downloadPath string) error {
 			offset += rangeLength
 			if err != nil {
 				if err != io.EOF {
-					log.Fatal(err)
+					return err
 				}
 			}
 		}
@@ -268,7 +303,7 @@ func (d *Downloader) Start(downloadPath string) error {
 			downloadedPieces++
 			continue
 		}
-		requests <- pieceRequest{
+		d.PieceRequestsCh <- pieceRequest{
 			Index:  i,
 			Hash:   d.Torrent.Pieces[i],
 			Length: pieceLength,
@@ -283,7 +318,7 @@ func (d *Downloader) Start(downloadPath string) error {
 	loop:
 		for i := 0; i < piecesToDownload; i++ {
 			select {
-			case resp := <-responses:
+			case resp := <-d.PieceResponseCh:
 				offset := 0
 				for _, r := range d.Ranges[resp.Index] {
 					rangeLength := r.end - r.start
@@ -297,12 +332,10 @@ func (d *Downloader) Start(downloadPath string) error {
 				}
 				downloadedPieces++
 				d.Progress <- float64(downloadedPieces) / float64(len(d.Torrent.Pieces)) * 100.0
-			case <-d.Done:
+			case <-d.Closed:
 				break loop
 			}
 		}
-		close(requests)
-		close(responses)
 		close(d.Done)
 		close(d.Progress)
 		for _, file := range d.Files {
@@ -313,47 +346,27 @@ func (d *Downloader) Start(downloadPath string) error {
 	return nil
 }
 
-type fileRange struct {
-	file  *os.File
-	start int
-	end   int
+func (d *Downloader) Close() {
+	close(d.Closed)
 }
 
-type pieceRequest struct {
-	Index  int
-	Hash   [20]byte
-	Length int
-}
-
-type pieceResponce struct {
-	Index int
-	Data  []byte
-}
-
-func generateClientID() [20]byte {
-	clientID := [20]byte{}
-	_, _ = rand.Read(clientID[:])
-	return clientID
-}
-
-func handlePeer(d *Downloader, addr string, requestsCh chan pieceRequest, responsesCh chan<- pieceResponce, retryCh chan<- string) {
+func handlePeer(d *Downloader, addr string) {
 	defer func() {
-		retryCh <- addr
+		d.RetryPeerCh <- addr
 	}()
 
-	peer := newPeer(addr)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), d.Config.PeerConnectionTimeout)
 	defer cancel()
+
+	peer := newPeer(addr)
 	conn, err := utp.DialContext(ctx, peer.Addr)
 
 	if err != nil {
 		log.Printf("failed to connect to peer %s: %s\n", peer, err)
 		return
 	}
-	defer func() {
-		conn.Close()
-		log.Printf("peer %s disconnected", peer)
-	}()
+
+	defer conn.Close()
 
 	err = peer.ShakeHands(conn, d.Config.FetchPeersTimeout, d.Torrent.InfoHash, d.ClientID)
 	if err != nil {
@@ -369,6 +382,7 @@ func handlePeer(d *Downloader, addr string, requestsCh chan pieceRequest, respon
 		MetadataSize int `bencode:"metadata_size"`
 		M            M   `bencode:"m"`
 	}
+
 	request := ExtendedHandShakeRequest{
 		MetadataSize: 0,
 		M: M{
@@ -381,13 +395,27 @@ func handlePeer(d *Downloader, addr string, requestsCh chan pieceRequest, respon
 		return
 	}
 	extendedHandShake := newExtendedMessage(0, requestBuf.Bytes())
-	_, err = conn.Write(extendedHandShake.Serialize())
-	if err != nil {
-		log.Println(err)
-		return
+	extendedHandShakeMsg := extendedHandShake.Serialize()
+
+	for {
+		_, err = conn.Write(extendedHandShakeMsg)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			} else {
+				log.Println(err)
+				return
+			}
+		} else {
+			break
+		}
 	}
-	var utMetadataID int
-	var metaDataSize int
+
+	var (
+		utMetadataID int
+		metaDataSize int
+	)
+
 loop0:
 	for {
 		msg, err := readMessage(conn, d.Config.ReadMessageTimeout)
@@ -428,27 +456,21 @@ loop0:
 		}
 	}
 
-	func() {
-		d.MetaDataCond.L.Lock()
-		defer d.MetaDataCond.L.Unlock()
-		if !d.MetaDataSignaled {
-			const PieceSize = 16384
-			d.MetaDataSize = metaDataSize
-			d.MetaDataPieceCount = (metaDataSize + PieceSize - 1) / PieceSize
-			d.MetaDataPieceSize = PieceSize
-			d.MetaDataPieceResCh = make(chan MetaDataPiece, d.MetaDataPieceCount)
-			d.MetaDataSignaled = true
-			d.MetaDataCond.Signal()
-			log.Println("Signaling MetaData Piece Count is: ", d.MetaDataPieceCount)
+	if d.MetaDataSizeCh != nil {
+		select {
+		case <-d.MetaDataSizeDoneCh:
+			break
+		case d.MetaDataSizeCh <- metaDataSize:
+			break
 		}
-	}()
+	}
 
-	if d.MetaDataPieceResCh != nil {
+	if d.MetaDataPieceCh != nil {
 		pieceIndex := 0
 
 	loop1:
 		for pieceIndex < d.MetaDataPieceCount {
-			should_advance := true
+			success := true
 			log.Println(peer, "requesting metadata piece", pieceIndex)
 			var reqPayload bytes.Buffer
 			req := struct {
@@ -463,32 +485,40 @@ loop0:
 				log.Println(err)
 				continue
 			}
-			reqMsg := newExtendedMessage(byte(utMetadataID), reqPayload.Bytes())
-			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			_, err := conn.Write(reqMsg.Serialize())
-			if err != nil {
-				log.Println(peer, "failed to write", err)
-				return
+
+			reqMsg := newExtendedMessage(byte(utMetadataID), reqPayload.Bytes()).Serialize()
+
+			for {
+				_, err := conn.Write(reqMsg)
+				if err != nil {
+					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+						continue
+					} else {
+						log.Println(err)
+						return
+					}
+				} else {
+					break
+				}
 			}
-			conn.SetWriteDeadline(time.Time{})
 
 			msg, err := readMessage(conn, d.Config.ReadMessageTimeout)
 			if err != nil {
-				log.Println(peer, "failed to read", err)
+				log.Println(err)
 				return
 			}
 			if msg == nil {
-				should_advance = false
+				success = false
 				continue
 			}
 			switch msg.ID {
 			case MessageBitfield:
 				peer.HandleBitFieldMessage(msg)
-				should_advance = false
+				success = false
 			case MessageExtended:
 				extended := convertMessageToExtended(msg)
 				if extended.Extension != byte(utMetadataID) {
-					should_advance = false
+					success = false
 					break
 				}
 				type Resp struct {
@@ -498,23 +528,22 @@ loop0:
 				resp := Resp{}
 				if err := bencode.Unmarshal(bytes.NewReader(extended.Payload), &resp); err != nil {
 					log.Println(peer, err)
-					should_advance = false
+					success = false
 					break
 				}
 				if resp.PieceIndex != pieceIndex {
 					log.Println(peer, "wanted piece", pieceIndex, "got", resp.PieceIndex)
-					should_advance = false
+					success = false
 					break
 				}
 
 				if resp.MessageType == 1 {
-					// log.Printf("Peer %v Got MetaData Piece %v\n", peer, pieceIndex)
 					s := fmt.Sprintf("d8:msg_typei1e5:piecei%de10:total_sizei%dee", pieceIndex, metaDataSize)
 					data := extended.Payload[len(s):]
 					select {
-					case <-d.MetaDataPieceResFinishedCh:
+					case <-d.MetaDataPiecesDoneCh:
 						break loop1
-					case d.MetaDataPieceResCh <- MetaDataPiece{Index: pieceIndex, Data: data}:
+					case d.MetaDataPieceCh <- MetaDataPiece{Index: pieceIndex, Data: data}:
 					}
 
 					log.Println(peer, "Sending Piece", pieceIndex)
@@ -523,7 +552,7 @@ loop0:
 				}
 			}
 
-			if should_advance {
+			if success {
 				pieceIndex++
 			}
 		}
@@ -542,34 +571,45 @@ loop0:
 		return
 	}
 
+loop2:
 	for {
-		request, ok := <-requestsCh
+		select {
+		case request, ok := <-d.PieceRequestsCh:
+			if !ok {
+				break loop2
+			}
 
-		if !ok {
-			break
-		}
+			if !peer.HasPiece(request.Index) {
+				d.PieceRequestsCh <- request
+				continue
+			}
 
-		if !peer.HasPiece(request.Index) {
-			requestsCh <- request
-			continue
-		}
+			data, err := peer.DownloadPiece(conn, d.Config.ReadMessageTimeout, request.Index, request.Length, request.Hash)
+			if err != nil {
+				d.PieceRequestsCh <- request
+				continue
+			}
 
-		data, err := peer.DownloadPiece(conn, d.Config.ReadMessageTimeout, request.Index, request.Length, request.Hash)
-		if err != nil {
-			requestsCh <- request
-			continue
-		}
-
-		haveMsg := composeHaveMessage(request.Index)
-		_, err = conn.Write(haveMsg.Serialize())
-		if err != nil {
-			log.Println(err)
-			requestsCh <- request
-			continue
-		}
-		responsesCh <- pieceResponce{
-			Index: request.Index,
-			Data:  data,
+			haveMsg := composeHaveMessage(request.Index).Serialize()
+			for {
+				_, err = conn.Write(haveMsg)
+				if err != nil {
+					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+						continue
+					} else {
+						log.Println(err)
+						d.PieceRequestsCh <- request
+					}
+				} else {
+					break
+				}
+			}
+			d.PieceResponseCh <- pieceResponce{
+				Index: request.Index,
+				Data:  data,
+			}
+		case <-d.Done:
+			break loop2
 		}
 	}
 }

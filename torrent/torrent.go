@@ -2,6 +2,7 @@ package torrent
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha1"
 	"encoding/hex"
 	"errors"
@@ -107,9 +108,7 @@ func ParseFile(filename string) (*Torrent, error) {
 		return nil, err
 	}
 
-	sha := sha1.New()
-	sha.Write(b.Bytes())
-	infoHash := sha.Sum(nil)
+	infoHash := sha1.Sum(b.Bytes())
 	t := &Torrent{
 		AnnounceUrls: announceUrls,
 		Name:         info.Name,
@@ -174,4 +173,10 @@ func (t Torrent) CalculatePieceLength(index int) int {
 		end = t.Length
 	}
 	return end - start
+}
+
+func generateClientID() [20]byte {
+	clientID := [20]byte{}
+	_, _ = rand.Read(clientID[:])
+	return clientID
 }
