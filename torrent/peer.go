@@ -3,7 +3,6 @@ package torrent
 import (
 	"bytes"
 	"crypto/sha1"
-	"encoding/base32"
 	"encoding/hex"
 	"fmt"
 	"log"
@@ -25,8 +24,11 @@ func newPeer(addr string) Peer {
 }
 
 func (p Peer) String() string {
-	id := base32.StdEncoding.EncodeToString(p.ID[:])
-	return fmt.Sprintf("%s-%s", id, p.Addr)
+	sha := sha1.New()
+	sha.Write(p.ID[:])
+	sha.Write([]byte(p.Addr))
+	hash := sha.Sum(nil)
+	return hex.EncodeToString(hash[:8])
 }
 
 func (p *Peer) ShakeHands(conn net.Conn, readTimeout time.Duration, infoHash [20]byte, ID [20]byte) error {
@@ -110,7 +112,7 @@ func (p *Peer) SetPiece(pieceIndex int) {
 	p.bf.Set(pieceIndex)
 }
 
-func (p *Peer) DownloadPiece(conn net.Conn, readTimeout time.Duration, pieceIndex int, pieceLength int, pieceHash [20]byte) ([]byte, error) {
+func (p *Peer) DownloadPiece(conn net.Conn, readTimeout time.Duration, pieceIndex int, pieceLength int, pieceHash [20]byte, logger *log.Logger) ([]byte, error) {
 	const MaxBlockSize = 16384
 	const MaxBacklog = 5
 
@@ -149,7 +151,7 @@ func (p *Peer) DownloadPiece(conn net.Conn, readTimeout time.Duration, pieceInde
 			if msg.ID == MessagePiece {
 				pieceMsg, err := parsePieceMessage(msg, pieceIndex, pieceLength)
 				if err != nil {
-					log.Println(err)
+					logger.Println(err)
 				} else {
 					copy(pieceData[pieceMsg.BlockOffset:], pieceMsg.BlockData)
 					downloaded += len(pieceMsg.BlockData)
@@ -158,14 +160,14 @@ func (p *Peer) DownloadPiece(conn net.Conn, readTimeout time.Duration, pieceInde
 			} else {
 				err := p.HandleMessage(msg)
 				if err != nil {
-					log.Println(err)
+					logger.Println(err)
 				}
 			}
 		}
 	}
 	hash := sha1.Sum(pieceData)
 	if !bytes.Equal(hash[:], pieceHash[:]) {
-		return nil, fmt.Errorf("piece %d failed integrity check got hash %s should be %s", pieceIndex, hex.EncodeToString(hash[:]), hex.EncodeToString(pieceHash[:]))
+		return nil, fmt.Errorf("Piece #%d failed integrity check got hash %s should be %s", pieceIndex, hex.EncodeToString(hash[:]), hex.EncodeToString(pieceHash[:]))
 	}
 	return pieceData, nil
 }

@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"sync/atomic"
 	"time"
 
 	"github.com/anacrolix/utp"
@@ -44,6 +45,7 @@ type MetaDataPiece struct {
 type Downloader struct {
 	Config  Config
 	Torrent *Torrent
+	Logger  *log.Logger
 
 	ClientID [20]byte
 	Port     int
@@ -57,6 +59,7 @@ type Downloader struct {
 
 	MetaDataPieceCh      chan MetaDataPiece
 	MetaDataPiecesDoneCh chan struct{}
+	GotMetaData          atomic.Bool
 
 	Files  []*os.File
 	Ranges map[int][]fileRange
@@ -73,7 +76,7 @@ type Downloader struct {
 	Progress chan float64
 }
 
-func NewDownloader(config Config, torrent *Torrent) *Downloader {
+func NewDownloader(config Config, torrent *Torrent, logger *log.Logger) *Downloader {
 	d := &Downloader{
 		Config:               config,
 		Torrent:              torrent,
@@ -87,21 +90,41 @@ func NewDownloader(config Config, torrent *Torrent) *Downloader {
 		Closed:               make(chan struct{}),
 		Done:                 make(chan struct{}),
 		Ranges:               make(map[int][]fileRange),
+		Logger:               logger,
 	}
 	if torrent.Length == 0 {
 		d.MetaDataSizeCh = make(chan int)
 		d.MetaDataPieceCh = make(chan MetaDataPiece)
+		d.GotMetaData.Store(false)
 	} else {
 		close(d.MetaDataSizeDoneCh)
 		close(d.MetaDataPiecesDoneCh)
+		d.GotMetaData.Store(true)
 	}
 	return d
 }
 
+func formatByteSize(bytes int64) (float64, string) {
+	units := []string{"B", "KB", "MB", "GB", "TB"}
+	size := float64(bytes)
+	unitIndex := 0
+
+	for size >= 1024 && unitIndex < len(units)-1 {
+		size /= 1024
+		unitIndex++
+	}
+
+	return size, units[unitIndex]
+}
+
 func (d *Downloader) Start(downloadPath string) error {
+	fmt.Printf("Starting downloader %s\n", hex.EncodeToString(d.ClientID[:]))
 	fmt.Println("InfoHash:", hex.EncodeToString(d.Torrent.InfoHash[:]))
-	fmt.Printf("Length: %d bytes\n", d.Torrent.Length)
-	fmt.Printf("Starting downloader with id: %s\n", hex.EncodeToString(d.ClientID[:]))
+
+	if d.Torrent.Length != 0 {
+		size, unit := formatByteSize(int64(d.Torrent.Length))
+		fmt.Printf("Length: %.2f %s bytes\n", size, unit)
+	}
 
 	go func() {
 		trackerURLs := make([]url.URL, 0, len(d.Torrent.AnnounceUrls))
@@ -109,27 +132,28 @@ func (d *Downloader) Start(downloadPath string) error {
 		for _, trackerURL := range d.Torrent.AnnounceUrls {
 			u, err := url.Parse(trackerURL)
 			if err != nil {
-				log.Printf("failed to parse tracker url '%v': %v\n", trackerURL, err)
+				d.Logger.Printf("Failed to parse tracker url '%v': %v\n", trackerURL, err)
 				continue
 			}
 			if !isTrackerURLSupported(*u) {
-				log.Printf("unsupported tracker url '%v'", trackerURL)
+				d.Logger.Printf("Unsupported tracker url '%v'", trackerURL)
 				continue
 			}
 			trackerURLs = append(trackerURLs, *u)
 		}
 
+		log.Println("Fetching peers from trackers")
 		for _, trackerURL := range trackerURLs {
 			go fetchPeers(d, trackerURL)
 		}
 
 		trackerTicker := time.NewTicker(d.Config.UpdateTrackersRate)
 		retryPeersTicker := time.NewTicker(d.Config.RetryPeersRate)
-
 	loop:
 		for {
 			select {
 			case <-trackerTicker.C:
+				log.Println("Fetching peers from trackers")
 				for _, trackerURL := range trackerURLs {
 					go fetchPeers(d, trackerURL)
 				}
@@ -150,6 +174,8 @@ func (d *Downloader) Start(downloadPath string) error {
 				}
 			case <-d.Done:
 				break loop
+			case <-d.Closed:
+				break loop
 			}
 		}
 	}()
@@ -157,75 +183,88 @@ func (d *Downloader) Start(downloadPath string) error {
 	if d.MetaDataSizeCh != nil {
 		const PieceSize = 16384
 
-		metaDataSize := <-d.MetaDataSizeCh
-		close(d.MetaDataSizeDoneCh)
+		select {
+		case metaDataSize := <-d.MetaDataSizeCh:
+			close(d.MetaDataSizeDoneCh)
 
-		d.MetaDataSize = metaDataSize
-		d.MetaDataPieceCount = (metaDataSize + PieceSize - 1) / PieceSize
-		d.MetaDataPieceSize = PieceSize
+			d.MetaDataSize = metaDataSize
+			d.MetaDataPieceCount = (metaDataSize + PieceSize - 1) / PieceSize
+			d.MetaDataPieceSize = PieceSize
 
-		metaDataPieces := make([][]byte, d.MetaDataPieceCount)
-		metaDataPieceCount := 0
-		for res := range d.MetaDataPieceCh {
-			if metaDataPieces[res.Index] == nil {
-				log.Printf("Downloader Got Meta Piece #%v out of %v\n", res.Index, d.MetaDataPieceCount)
-				metaDataPieces[res.Index] = res.Data
-				metaDataPieceCount++
+			log.Printf("Fetching meta data info (%d) pieces\n", d.MetaDataPieceCount)
+
+			metaDataPieces := make([][]byte, d.MetaDataPieceCount)
+			metaDataPieceCount := 0
+			for res := range d.MetaDataPieceCh {
+				if metaDataPieces[res.Index] == nil {
+					log.Printf("Fetched meta data info piece #%v\n", res.Index+1)
+					metaDataPieces[res.Index] = res.Data
+					metaDataPieceCount++
+				}
+				if metaDataPieceCount == d.MetaDataPieceCount {
+					break
+				}
 			}
-			if metaDataPieceCount == d.MetaDataPieceCount {
-				break
+
+			metaDataBuf := make([]byte, d.MetaDataSize)
+			for i := 0; i < len(metaDataPieces); i++ {
+				copy(metaDataBuf[i*d.MetaDataPieceSize:], metaDataPieces[i])
 			}
-		}
 
-		metaDataBuf := make([]byte, d.MetaDataSize)
-		for i := 0; i < len(metaDataPieces); i++ {
-			copy(metaDataBuf[i*d.MetaDataPieceSize:], metaDataPieces[i])
-		}
-
-		infoHash := sha1.Sum(metaDataBuf)
-		if !bytes.Equal(infoHash[:], d.Torrent.InfoHash[:]) {
-			return errors.New("invalid magnent link")
-		}
-
-		info := TorrentInfo{}
-		if err := bencode.Unmarshal(bytes.NewReader(metaDataBuf), &info); err != nil {
-			return err
-		}
-
-		length := 0
-		var files []FileInfo
-
-		if info.Length != 0 && len(info.Files) == 0 {
-			length = info.Length
-			files = []FileInfo{{Length: length, Path: info.Name}}
-		} else {
-			for _, file := range info.Files {
-				length += file.Length
-				fileInfo := FileInfo{Length: file.Length, Path: path.Join(file.Path...)}
-				files = append(files, fileInfo)
+			infoHash := sha1.Sum(metaDataBuf)
+			if !bytes.Equal(infoHash[:], d.Torrent.InfoHash[:]) {
+				return errors.New("invalid magnent link")
 			}
-		}
 
-		if len(info.Pieces)%20 != 0 {
-			return errors.New("invalid torrent file: size of pieces hashes string must be divisable by 20")
-		}
+			info := TorrentInfo{}
+			if err := bencode.Unmarshal(bytes.NewReader(metaDataBuf), &info); err != nil {
+				return err
+			}
 
-		pieceCount := len(info.Pieces) / 20
-		pieces := make([][20]byte, pieceCount)
-		for i := 0; i < pieceCount; i++ {
-			copy(pieces[i][:], info.Pieces[i*20:i*20+20])
-		}
+			length := 0
+			var files []FileInfo
 
-		d.Torrent.MetaData = MetaData{
-			Length:      length,
-			Files:       files,
-			PieceLength: info.PieceLength,
-			Pieces:      pieces,
+			if info.Length != 0 && len(info.Files) == 0 {
+				length = info.Length
+				files = []FileInfo{{Length: length, Path: info.Name}}
+			} else {
+				for _, file := range info.Files {
+					length += file.Length
+					fileInfo := FileInfo{Length: file.Length, Path: path.Join(file.Path...)}
+					files = append(files, fileInfo)
+				}
+			}
+
+			if len(info.Pieces)%20 != 0 {
+				return errors.New("invalid torrent file: size of pieces hashes string must be divisable by 20")
+			}
+
+			pieceCount := len(info.Pieces) / 20
+			pieces := make([][20]byte, pieceCount)
+			for i := 0; i < pieceCount; i++ {
+				copy(pieces[i][:], info.Pieces[i*20:i*20+20])
+			}
+
+			d.Torrent.MetaData = MetaData{
+				Length:      length,
+				Files:       files,
+				PieceLength: info.PieceLength,
+				Pieces:      pieces,
+			}
+			d.Torrent.Name = info.Name
+
+			d.GotMetaData.Store(true)
+
+			log.Println("Meta data info fetched successfully")
+
+			size, unit := formatByteSize(int64(d.Torrent.Length))
+			fmt.Printf("Length: %.2f %s bytes\n", size, unit)
+		case <-d.Done:
+			return nil
+		case <-d.Closed:
+			return nil
 		}
-		d.Torrent.Name = info.Name
 	}
-
-	log.Println("Got Meta Data Info")
 
 	for _, info := range d.Torrent.Files {
 		filePath := path.Join(downloadPath, info.Path)
@@ -283,6 +322,8 @@ func (d *Downloader) Start(downloadPath string) error {
 	d.PieceRequestsCh = make(chan pieceRequest, len(d.Torrent.Pieces))
 	d.PieceResponseCh = make(chan pieceResponce, len(d.Torrent.Pieces))
 
+	log.Println("Queuing pieces for download")
+
 	for i := 0; i < len(d.Torrent.Pieces); i++ {
 		pieceLength := d.Torrent.CalculatePieceLength(i)
 		piece := make([]byte, pieceLength)
@@ -299,7 +340,6 @@ func (d *Downloader) Start(downloadPath string) error {
 		}
 		pieceHash := sha1.Sum(piece)
 		if bytes.Equal(pieceHash[:], d.Torrent.Pieces[i][:]) {
-			log.Printf("piece #%d is checkedout\n", i)
 			downloadedPieces++
 			continue
 		}
@@ -308,11 +348,12 @@ func (d *Downloader) Start(downloadPath string) error {
 			Hash:   d.Torrent.Pieces[i],
 			Length: pieceLength,
 		}
-		log.Printf("queuing piece #%d\n", i)
 	}
 
 	piecesToDownload := len(d.Torrent.Pieces) - downloadedPieces
 	d.Progress = make(chan float64, piecesToDownload)
+
+	log.Printf("Downloaded (%v) pieces before\n", downloadedPieces)
 
 	go func(downloadedPieces int, piecesToDownload int) {
 	loop:
@@ -362,15 +403,22 @@ func handlePeer(d *Downloader, addr string) {
 	conn, err := utp.DialContext(ctx, peer.Addr)
 
 	if err != nil {
-		log.Printf("failed to connect to peer %s: %s\n", peer, err)
+		log.Printf("Couldn't connect to peer %s\n", peer)
+		d.Logger.Printf("Failed to connect to peer %s-%s: %s\n", peer, peer.Addr, err)
 		return
 	}
 
-	defer conn.Close()
+	log.Printf("Connected to peer %v\n", peer)
+
+	defer func() {
+		log.Printf("Peer %v disconnected\n", peer)
+		d.Logger.Printf("Peer %v-%v disconnected\n", peer, peer.Addr)
+		conn.Close()
+	}()
 
 	err = peer.ShakeHands(conn, d.Config.FetchPeersTimeout, d.Torrent.InfoHash, d.ClientID)
 	if err != nil {
-		log.Printf("ecountered an error with peer %s: %s\n", peer, err)
+		d.Logger.Printf("Ecountered an error with peer %s-%s: %s\n", peer, peer.Addr, err)
 		return
 	}
 
@@ -391,7 +439,7 @@ func handlePeer(d *Downloader, addr string) {
 	}
 	var requestBuf bytes.Buffer
 	if err := bencode.Marshal(&requestBuf, request); err != nil {
-		log.Println(err)
+		d.Logger.Println(err)
 		return
 	}
 	extendedHandShake := newExtendedMessage(0, requestBuf.Bytes())
@@ -403,7 +451,7 @@ func handlePeer(d *Downloader, addr string) {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
 			} else {
-				log.Println(err)
+				d.Logger.Println(err)
 				return
 			}
 		} else {
@@ -420,7 +468,7 @@ loop0:
 	for {
 		msg, err := readMessage(conn, d.Config.ReadMessageTimeout)
 		if err != nil {
-			log.Println(err)
+			d.Logger.Printf("Ecountered an error with peer %s-%s: %s\n", peer, peer.Addr, err)
 			return
 		}
 		if msg == nil {
@@ -432,7 +480,7 @@ loop0:
 		case MessageExtended:
 			extended := convertMessageToExtended(msg)
 			if extended.Extension != 0 {
-				log.Printf("ecountered an error with peer %s: extention must be zero\n", peer)
+				d.Logger.Printf("Ecountered an error with peer %s-%s: extention must be zero\n", peer, peer.Addr)
 				return
 			}
 
@@ -447,7 +495,7 @@ loop0:
 
 			r := ExtendedHandShakeResponse{}
 			if err := bencode.Unmarshal(bytes.NewReader(extended.Payload), &r); err != nil {
-				log.Println(err)
+				d.Logger.Printf("Ecountered an error with peer %s-%s: %s\n", peer, peer.Addr, err)
 				return
 			}
 			metaDataSize = r.MetadataSize
@@ -469,9 +517,9 @@ loop0:
 		pieceIndex := 0
 
 	loop1:
-		for pieceIndex < d.MetaDataPieceCount {
+		for pieceIndex < d.MetaDataPieceCount && !d.GotMetaData.Load() {
 			success := true
-			log.Println(peer, "requesting metadata piece", pieceIndex)
+
 			var reqPayload bytes.Buffer
 			req := struct {
 				MessageType int `bencode:"msg_type"`
@@ -480,9 +528,8 @@ loop0:
 				MessageType: 0,
 				PieceIndex:  pieceIndex,
 			}
-			log.Println(peer, "Marshaling request", pieceIndex)
+
 			if err := bencode.Marshal(&reqPayload, req); err != nil {
-				log.Println(err)
 				continue
 			}
 
@@ -494,7 +541,7 @@ loop0:
 					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 						continue
 					} else {
-						log.Println(err)
+						d.Logger.Printf("Ecountered an error with peer %s-%s: %s\n", peer, peer.Addr, err)
 						return
 					}
 				} else {
@@ -504,7 +551,7 @@ loop0:
 
 			msg, err := readMessage(conn, d.Config.ReadMessageTimeout)
 			if err != nil {
-				log.Println(err)
+				d.Logger.Printf("Ecountered an error with peer %s-%s: %s\n", peer, peer.Addr, err)
 				return
 			}
 			if msg == nil {
@@ -527,12 +574,10 @@ loop0:
 				}
 				resp := Resp{}
 				if err := bencode.Unmarshal(bytes.NewReader(extended.Payload), &resp); err != nil {
-					log.Println(peer, err)
 					success = false
 					break
 				}
 				if resp.PieceIndex != pieceIndex {
-					log.Println(peer, "wanted piece", pieceIndex, "got", resp.PieceIndex)
 					success = false
 					break
 				}
@@ -545,10 +590,8 @@ loop0:
 						break loop1
 					case d.MetaDataPieceCh <- MetaDataPiece{Index: pieceIndex, Data: data}:
 					}
-
-					log.Println(peer, "Sending Piece", pieceIndex)
 				} else if resp.MessageType == 2 {
-					log.Printf("Peer %v MetaData Piece %v got rejected", peer, pieceIndex)
+					d.Logger.Printf("Peer %v-%v meta data info Piece #%v got rejected", peer, peer.Addr, pieceIndex)
 				}
 			}
 
@@ -558,16 +601,17 @@ loop0:
 		}
 	}
 
-	log.Println(peer, "Ready to download")
+	log.Printf("Peer %v is ready\n", peer)
 
 	err = peer.SendUnchokeMessage(conn)
 	if err != nil {
-		log.Printf("ecountered an error with peer %s: %s\n", peer, err)
+		d.Logger.Printf("Ecountered an error with peer %s-%s: %s\n", peer, peer.Addr, err)
 		return
 	}
+
 	err = peer.SendInterestedMessage(conn)
 	if err != nil {
-		log.Printf("ecountered an error with peer %s: %s\n", peer, err)
+		d.Logger.Printf("Ecountered an error with peer %s-%s: %s\n", peer, peer.Addr, err)
 		return
 	}
 
@@ -584,8 +628,9 @@ loop2:
 				continue
 			}
 
-			data, err := peer.DownloadPiece(conn, d.Config.ReadMessageTimeout, request.Index, request.Length, request.Hash)
+			data, err := peer.DownloadPiece(conn, d.Config.ReadMessageTimeout, request.Index, request.Length, request.Hash, d.Logger)
 			if err != nil {
+				d.Logger.Printf("Ecountered an error with peer %s-%s: %s\n", peer, peer.Addr, err)
 				d.PieceRequestsCh <- request
 				continue
 			}
@@ -597,7 +642,7 @@ loop2:
 					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 						continue
 					} else {
-						log.Println(err)
+						d.Logger.Printf("Ecountered an error with peer %s-%s: %s\n", peer, peer.Addr, err)
 						d.PieceRequestsCh <- request
 					}
 				} else {

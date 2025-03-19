@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -12,7 +13,7 @@ import (
 )
 
 func main() {
-	log.SetFlags(log.LUTC | log.Llongfile)
+	log.SetFlags(0)
 
 	cfg := torrent.Config{}
 	flag.DurationVar(&cfg.FetchPeersTimeout, "fetch-peers-timeout", 10*time.Second, "fetch peers timeout")
@@ -24,6 +25,7 @@ func main() {
 	filePath := flag.String("file", "", "path of torrent file")
 	magnet := flag.String("magnet", "", "magnet link")
 	downloadPath := flag.String("path", ".", "download path")
+	debug := flag.Bool("debug", false, "debug")
 	flag.Parse()
 
 	var (
@@ -33,15 +35,25 @@ func main() {
 
 	if *magnet != "" {
 		t, err = torrent.ParseMagnet(*magnet)
+		if err != nil {
+			log.Fatalf("Failed to parse magnet link %v: %v", *magnet, err)
+		}
 	} else {
 		t, err = torrent.ParseFile(*filePath)
+		if err != nil {
+			log.Fatalf("Failed to parse torrent file %v: %v", *filePath, err)
+		}
 	}
 
-	if err != nil {
-		log.Fatalf("failed to parse torrent %v: %v", *filePath, err)
+	var logger *log.Logger
+
+	if *debug {
+		logger = log.New(os.Stderr, "DEBUG ", log.Lshortfile|log.LUTC)
+	} else {
+		logger = log.New(io.Discard, "", 0)
 	}
 
-	d := torrent.NewDownloader(cfg, t)
+	d := torrent.NewDownloader(cfg, t, logger)
 
 	go func() {
 		closeSig := make(chan os.Signal, 1)
@@ -60,8 +72,10 @@ loop:
 		select {
 		case <-d.Done:
 			break loop
+		case <-d.Closed:
+			break loop
 		case p := <-d.Progress:
-			log.Printf("download progress %.2f%%\n", p)
+			log.Printf("Download progress %.2f%%\n", p)
 		}
 	}
 }
